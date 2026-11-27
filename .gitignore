@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Датасет и результаты
+/ML_Dataset/
+/ML_Dataset Выборка/
+Результаты/
+Результаты_benchmark/
+Старые веса/
+review_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets & Environment
+.env
+
+# Локальные материалы презентации и спецификация
+INTEGRATION_SPEC.md
+PRESENTATION_SPEECH.md
+PROJECT_SPECIFICATION.md
+
+# Тестовые PDF с реальными документами (в репе хранится только пустая папка)
+Test_PDFs/*.pdf
+
+# Локальные утилиты обучения, сбора датасета и запасные веса
+AGENTS.md
+PreAnnotator.py
+build_clean_yolo_dataset.py
+colab_train_gold_standard.py
+mine_300_samples.py
+Новые веса/best_clean_v2_gold.pt
+
+# Контекст агентов (локальные пути)
+GEMINI.md
+STATE.md
