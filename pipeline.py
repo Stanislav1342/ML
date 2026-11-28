@@ -13,13 +13,12 @@ from typing import List, Optional, Tuple
 import uuid
 
 import cv2
-import easyocr
 import fitz
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.optimize import linear_sum_assignment
-import torch
-from ultralytics import YOLO
+
+from inference_backend import InferenceBackend, create_inference_backend, verify_weight_integrity
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -401,71 +400,33 @@ class Pipeline:
     @staticmethod
     def _verify_weight_integrity(model_path: str, allow_untrusted: bool = False):
         """Проверяет SHA-256 контрольную сумму весов до загрузки PyTorch (защита от Pickle RCE)."""
-        path = Path(model_path)
-        if not path.exists():
-            return
-
-        KNOWN_HASHES = {
-            "best_clean.pt": "0bdfcbbabf8a987a6f5a2cd2648f96213c65dd8225101f7b1021074ae17d2747",
-            "best_clean_966.pt": "0bf3ac31e82d93c8d3a8dc71b0be66d8b95ff693e1926a95add8ea3cf286d7d7",
-            "best_clean_966_2026-11-19.pt": "0bf3ac31e82d93c8d3a8dc71b0be66d8b95ff693e1926a95add8ea3cf286d7d7",
-            "best_clean_v2_gold.pt": "d5bca87876bde838ac9fc0bb8e3a846d8b860266fec9719a9c2b17466d1b4333",
-            "best_clean_prev.pt": "5d419954991aa03f78d1e73fd6ec23a02ce2731c5dae88a79fd8c5ba49b5db95",
-            "best_digit_classifier.pt": "48196c721a78735ee05875d9c944e128c7fc503a5f6dc9c0173368d334c40f2a",
-            "best_digit_classifier_41cls_2026-09-24.pt": "18f1847773f6a517f09cdb03d4db219fbd302807ec43a35b3c9bfafda799b874",
-        }
-        with open(path, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()
-
-        if path.name in KNOWN_HASHES:
-            if file_hash != KNOWN_HASHES[path.name]:
-                raise RuntimeError(
-                    f"Критическая ошибка ИБ: Хэш файла {path.name} ({file_hash}) не совпадает с доверенным! "
-                    "Загрузка модели заблокирована во избежание Pickle RCE."
-                )
-            return
-
-        if file_hash in KNOWN_HASHES.values():
-            return
-
-        if not allow_untrusted:
-            raise RuntimeError(
-                f"Критическая ошибка ИБ: Модель {path.name} (хэш: {file_hash}) отсутствует в реестре доверенных весов! "
-                "Загрузка заблокирована во избежание Pickle RCE. "
-                "Для принудительного использования сторонних весов укажите флаг --allow-untrusted-weights."
-            )
-        logger.warning(
-            f"ВНИМАНИЕ [ИБ]: Модель {path.name} отсутствует в реестре доверенных весов. "
-            "Принудительная загрузка разрешена параметром allow_untrusted."
-        )
+        return verify_weight_integrity(model_path, allow_untrusted=allow_untrusted)
 
     def __init__(
         self,
         yolo_model_path: str = "Новые веса/best_clean.pt",
         digit_classifier_path: str = "Новые веса/best_digit_classifier.pt",
         allow_untrusted_weights: bool = False,
+        backend: Optional[InferenceBackend] = None,
     ):
-        self._verify_weight_integrity(yolo_model_path, allow_untrusted=allow_untrusted_weights)
-        self._verify_weight_integrity(digit_classifier_path, allow_untrusted=allow_untrusted_weights)
-
-        logger.info(f"Загрузка YOLOv8 ({yolo_model_path})...")
-        self.yolo = YOLO(yolo_model_path)
-
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-        if self.device == "cpu" and not os.getenv("OMP_NUM_THREADS"):
-            cpu_total = os.cpu_count() or 4
-            torch.set_num_threads(min(8, max(2, (cpu_total * 3) // 4)))
-        logger.info(f"Используемое устройство вычислений: {self.device}")
-
-        logger.info(f"Загрузка кастомного классификатора цифр YOLOv8 ({digit_classifier_path}) и EasyOCR...")
-        self.easyocr = easyocr.Reader(["ru"], gpu=(self.device != "cpu"))
-        self.digit_classifier = YOLO(digit_classifier_path)
+        self.backend: InferenceBackend = (
+            backend
+            if backend is not None
+            else create_inference_backend(
+                yolo_model_path=yolo_model_path,
+                digit_classifier_path=digit_classifier_path,
+                allow_untrusted_weights=allow_untrusted_weights,
+            )
+        )
         self.spatial_resolver = SpatialResolver(boundary_margin=25.0)
+
+    @property
+    def weights_version(self) -> str:
+        return self.backend.weights_version
+
+    @property
+    def device(self) -> str:
+        return getattr(self.backend, "detect_device", "remote")
 
     @staticmethod
     def _normalize_ml_number(text: str) -> str:
@@ -527,10 +488,9 @@ class Pipeline:
         try:
             img = Image.open(img_path).convert("RGB")
             crop_img = self._crop_digit_square(img, bbox)
-            res = self.digit_classifier(crop_img, verbose=False)[0]
-            top1_idx = int(res.probs.top1)
-            top1_conf = float(res.probs.top1conf)
-            predicted_class = str(res.names[top1_idx])
+            res = self.backend.classify_crops([crop_img])[0]
+            top1_conf = float(res["confidence"])
+            predicted_class = str(res["class_name"])
             if predicted_class == "unknown" or top1_conf < 0.58:
                 return "", predicted_class, top1_conf
             return predicted_class, predicted_class, top1_conf
@@ -623,25 +583,21 @@ class Pipeline:
                 crop_cv = cv2.resize(crop_cv, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
             if ocr_type == "easyocr":
-                kwargs = {"detail": 0}
-                if is_digit:
-                    kwargs["allowlist"] = "0123456789"
-                elif allowlist:
-                    kwargs["allowlist"] = allowlist
-                results = self.easyocr.readtext(crop_cv, **kwargs)
-                return " ".join(results) if results else ""
+                effective_allowlist = "0123456789" if is_digit else allowlist
+                items = self.backend.ocr_crops([(crop_cv, effective_allowlist)])[0]
+                return " ".join(it["text"] for it in items if it.get("text")) if items else ""
 
             if ocr_type == "easyocr_driver":
-                kwargs = {}
-                if allowlist:
-                    kwargs["allowlist"] = allowlist
-                results = self.easyocr.readtext(crop_cv, **kwargs)
-                if not results:
+                items = self.backend.ocr_crops([(crop_cv, allowlist)])[0]
+                if not items:
                     return "Unknown"
 
                 h_crop = crop_cv.shape[0]
                 name_words = []
-                for bbox_pts, text, conf in results:
+                for it in items:
+                    bbox_pts = it["bbox"]
+                    text = it["text"]
+                    conf = float(it["confidence"])
                     clean = re.sub(r"[^а-яА-ЯёЁ]", "", text)
                     is_footnote = bool(
                         re.search(
@@ -660,7 +616,7 @@ class Pipeline:
                             name_words.append((x_center, w_clean))
 
                 if not name_words:
-                    fallback_text = results[0][1] if results else "Unknown"
+                    fallback_text = items[0]["text"] if items else "Unknown"
                     # Санитизация для предотвращения Path Traversal при создании каталогов.
                     clean_fallback = re.sub(r"[^\w\s\-]", "", fallback_text).strip()
                     return clean_fallback or "Unknown"
@@ -767,7 +723,6 @@ class Pipeline:
     ) -> List[Tuple[MLContext, List[PageResult]]]:
         ext_clean = ".jpg" if image_ext.lower() in (".jpg", ".jpeg") else ".png"
         chunk_size = 16
-        yolo_batch = 4 if self.device == "cpu" else 16
 
         segments: List[Tuple[MLContext, List[PageResult]]] = []
         ml_context = MLContext()
@@ -794,6 +749,7 @@ class Pipeline:
                 chunk_paths: List[Path] = []
                 chunk_grays: List[np.ndarray] = []
                 chunk_bgr_imgs: List[np.ndarray] = []
+                chunk_pil_imgs: List[Image.Image] = []
 
                 t0 = time.perf_counter()
                 for i in range(chunk_start, chunk_end):
@@ -813,18 +769,17 @@ class Pipeline:
                     chunk_paths.append(img_path)
                     chunk_grays.append(page_gray)
                     chunk_bgr_imgs.append(bgr_img)
+                    chunk_pil_imgs.append(Image.fromarray(page_gray).convert("RGB"))
                     if progress_callback is not None:
                         progress_callback(i + 1, total_to_render, "render")
                 t_render += time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                chunk_results = self.yolo(
-                    chunk_bgr_imgs,
-                    verbose=False,
+                chunk_results = self.backend.detect_pages(
+                    chunk_pil_imgs,
+                    imgsz=1024,
                     conf=0.12,
                     iou=0.45,
-                    imgsz=1024,
-                    batch=yolo_batch,
                 )
                 t_yolo += time.perf_counter() - t0
                 if progress_callback is not None:
@@ -833,45 +788,45 @@ class Pipeline:
                 chunk_prepared = []
                 chunk_digit_items = []
 
-                for offset, res in enumerate(chunk_results):
+                for offset, page_dets in enumerate(chunk_results):
                     global_i = chunk_start + offset
                     img_path = str(chunk_paths[offset])
                     page_gray = chunk_grays[offset]
                     bgr_img = chunk_bgr_imgs[offset]
+                    page_pil = chunk_pil_imgs[offset]
                     gh, gw = page_gray.shape
                     detections = []
 
-                    if res.boxes is not None:
-                        for box in res.boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                            cls_id = int(box.cls[0].cpu().numpy())
-                            conf = float(box.conf[0].cpu().numpy())
-                            label = CLASS_NAMES[cls_id]
+                    for det in page_dets:
+                        x1, y1, x2, y2 = det["bbox"]
+                        cls_id = int(det["class_id"])
+                        conf = float(det["confidence"])
+                        label = det.get("class_name") or CLASS_NAMES[cls_id]
 
-                            min_conf = 0.20
-                            if label == "Печать":
-                                min_conf = 0.40
-                            elif label == "Расшифровка печать":
-                                min_conf = 0.12
-                            elif label == "Подпись":
-                                min_conf = 0.13
-                            elif label in ("Окно аптеки", "Qr code"):
-                                min_conf = 0.25
+                        min_conf = 0.20
+                        if label == "Печать":
+                            min_conf = 0.40
+                        elif label == "Расшифровка печать":
+                            min_conf = 0.12
+                        elif label == "Подпись":
+                            min_conf = 0.13
+                        elif label in ("Окно аптеки", "Qr code"):
+                            min_conf = 0.25
 
-                            if conf < min_conf:
+                        if conf < min_conf:
+                            continue
+
+                        # Отсекаем фантомы "Печать" на пустой клетке, сохраняя уверенные бледные оттиски (conf >= 0.85).
+                        if label == "Печать" and conf < 0.85:
+                            rx1 = max(0, int(x1))
+                            ry1 = max(0, int(y1))
+                            rx2 = min(gw, int(x2))
+                            ry2 = min(gh, int(y2))
+                            roi = page_gray[ry1:ry2, rx1:rx2]
+                            if roi.size > 0 and float(np.mean(roi < 240)) < 0.085:
                                 continue
 
-                            # Отсекаем фантомы "Печать" на пустой клетке, сохраняя уверенные бледные оттиски (conf >= 0.85).
-                            if label == "Печать" and conf < 0.85:
-                                rx1 = max(0, int(x1))
-                                ry1 = max(0, int(y1))
-                                rx2 = min(gw, int(x2))
-                                ry2 = min(gh, int(y2))
-                                roi = page_gray[ry1:ry2, rx1:rx2]
-                                if roi.size > 0 and float(np.mean(roi < 240)) < 0.085:
-                                    continue
-
-                            detections.append(Detection(label, conf, BBox(x1, y1, x2, y2)))
+                        detections.append(Detection(label, conf, BBox(x1, y1, x2, y2)))
 
                     has_title = any(d.label == "Титульный лист" for d in detections)
                     ml_number_det = next((d for d in detections if d.label == "Номер МЛ"), None) if has_title else None
@@ -996,15 +951,10 @@ class Pipeline:
 
                 if chunk_digit_items:
                     t0 = time.perf_counter()
-                    cls_results = self.digit_classifier(
-                        [crop for _, crop in chunk_digit_items],
-                        batch=64,
-                        verbose=False,
-                    )
+                    cls_results = self.backend.classify_crops([crop for _, crop in chunk_digit_items])
                     for (d, _), cls_res in zip(chunk_digit_items, cls_results):
-                        top1_idx = int(cls_res.probs.top1)
-                        top1_conf = float(cls_res.probs.top1conf)
-                        predicted_class = str(cls_res.names[top1_idx])
+                        top1_conf = float(cls_res["confidence"])
+                        predicted_class = str(cls_res["class_name"])
                         if predicted_class == "unknown" or top1_conf < 0.58:
                             d.ocr_text = ""
                         else:
@@ -1127,7 +1077,10 @@ class Pipeline:
                                 if scale < 1.0
                                 else left_crop
                             )
-                            for bbox, text, conf in self.easyocr.readtext(ocr_crop):
+                            for item in self.backend.ocr_crops([(ocr_crop, None)])[0]:
+                                bbox = item["bbox"]
+                                text = item["text"]
+                                conf = float(item["confidence"])
                                 if re.search(r"п[оа0][лпда][уy][ч4]", text.lower()) and conf > 0.35:
                                     word_top_y = min(pt[1] for pt in bbox) / scale
                                     return_split_y = float(sub_y1) + word_top_y
