@@ -52,3 +52,7 @@ STATE.md
 
 # Офлайн-веса EasyOCR (подготавливаются через prepare_ocr_weights.py)
 ocr_models/
+
+# Обезличенный контрольный набор и данные Docker-теста
+golden_dataset/
+review_data_docker/

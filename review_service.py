@@ -610,7 +610,8 @@ class ReviewService:
         start_workers: bool = True,
         job_workers: Optional[int] = None,
     ):
-        self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
+        env_data_dir = os.getenv("REVIEW_DATA_DIR", "").strip()
+        self.data_dir = Path(data_dir) if data_dir else (Path(env_data_dir) if env_data_dir else DEFAULT_DATA_DIR)
         self.sessions_dir = self.data_dir / "sessions"
         self.jobs_dir = self.data_dir / "jobs"
         self.tmp_dir = self.data_dir / "tmp"
@@ -3459,8 +3460,12 @@ def serve(
     preload: bool = False,
 ) -> None:
     """Запускает локальный многопоточный HTTP-сервер ML-модуля."""
-    if not _is_loopback_host(host):
-        raise ValueError("Из соображений ИБ разрешён запуск review_service только на loopback-адресе (127.0.0.1 / localhost).")
+    allow_non_loopback = os.getenv("ALLOW_NON_LOOPBACK", "0").strip().lower() in ("1", "true", "yes")
+    if not _is_loopback_host(host) and not allow_non_loopback:
+        raise ValueError(
+            "Из соображений ИБ разрешён запуск review_service только на loopback-адресе (127.0.0.1 / localhost). "
+            "Для контейнера задайте ALLOW_NON_LOOPBACK=1."
+        )
     api_token = os.getenv("ML_API_TOKEN") or None
     service = ReviewService(data_dir=data_dir)
     if preload:
@@ -3481,14 +3486,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Локальный ML-сервис разбора маршрутных листов и карантина дообучения")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    default_data_dir = os.getenv("REVIEW_DATA_DIR", "").strip() or str(DEFAULT_DATA_DIR)
     p_serve = sub.add_parser("serve", help="Запустить локальный HTTP API-сервер")
-    p_serve.add_argument("--host", type=str, default=DEFAULT_HOST, help="Хост (только loopback, по умолчанию 127.0.0.1)")
+    p_serve.add_argument("--host", type=str, default=DEFAULT_HOST, help="Хост (по умолчанию 127.0.0.1)")
     p_serve.add_argument("--port", type=int, default=DEFAULT_PORT, help="Порт (по умолчанию 8765)")
-    p_serve.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR), help="Каталог сессий и карантина")
+    p_serve.add_argument("--data-dir", type=str, default=default_data_dir, help="Каталог сессий и карантина")
     p_serve.add_argument("--preload", action="store_true", help="Предзагрузить модели сразу при старте")
 
     p_exp = sub.add_parser("export-approved", help="Выгрузить одобренные правки из карантина")
-    p_exp.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR), help="Каталог сессий и карантина")
+    p_exp.add_argument("--data-dir", type=str, default=default_data_dir, help="Каталог сессий и карантина")
     p_exp.add_argument("--include-exported", action="store_true", help="Повторно включить ранее выгруженные записи")
 
     args = parser.parse_args()

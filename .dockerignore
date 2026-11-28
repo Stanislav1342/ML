@@ -1,0 +1,31 @@
+.git
+.gitignore
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+Test_PDFs
+Новые веса
+Старые веса
+ocr_models
+review_data
+review_data_docker
+Результаты
+Результаты_benchmark
+golden_dataset
+*.pt
+*.pth
+*.pdf
+*.zip
+*.ipynb
+.env
+.DS_Store
+GEMINI.md
+STATE.md
+AGENTS.md
+INTEGRATION_SPEC.md
+PRESENTATION_SPEECH.md
+PROJECT_SPECIFICATION.md

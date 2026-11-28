@@ -1,0 +1,24 @@
+services:
+  waybills-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: waybills-cpu
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./review_data_docker:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      INFERENCE_MODE: "http"
+      INFERENCE_BASE_URL: "http://host.docker.internal:8000"
+      INFERENCE_API_KEY: "${INFERENCE_SERVER_TOKEN:-}"
+      INFERENCE_TRUST_ENV: "0"
+      REVIEW_DATA_DIR: "/data"
+      ALLOW_NON_LOOPBACK: "1"
+      MAX_PDF_PAGES: "3500"
+      LARGE_PDF_POLICY: "reject"
+      JOB_WORKERS: "2"
+      ML_API_TOKEN: "${ML_API_TOKEN:-}"
+    restart: unless-stopped

@@ -8,19 +8,24 @@
 - `run_pipeline.py` — скрипт пакетного запуска проверки всех PDF из `Test_PDFs/` с сохранением результатов в `Результаты/`.
 - `update.py` — скрипт обновления проекта из ветки `main` на GitHub без использования `git.exe` (для корпоративных рабочих станций).
 - `requirements.txt` — список зависимостей Python.
-- `Новые веса/` — верифицированные веса обученных моделей:
-  - `best_clean.pt` — детектор элементов маршрутного листа (14 классов);
-  - `best_digit_classifier.pt` — классификатор кропов печатных и рукописных цифр (39 классов).
+- `Новые веса/` — верифицированные веса обученных моделей (`weights_version: waybills-cv-v1.4.1`):
+  - `best_clean.pt` — детектор элементов маршрутного листа (14 классов, SHA-256: `0bdfcbbabf8a987a6f5a2cd2648f96213c65dd8225101f7b1021074ae17d2747`);
+  - `best_digit_classifier.pt` — классификатор кропов печатных и рукописных цифр (39 классов, SHA-256: `48196c721a78735ee05875d9c944e128c7fc503a5f6dc9c0173368d334c40f2a`).
 - `Test_PDFs/` — входной каталог для проверяемых PDF-файлов.
 - `Результаты/` — выходной каталог отчётов (создаётся при запуске, не отслеживается в Git).
 
 ## Установка зависимостей
 
-```bash
-pip install -r requirements.txt
-```
+- Для CPU-сервиса (`review_service.py` в режиме `INFERENCE_MODE=http`, Kubernetes):
+  ```bash
+  pip install -r requirements-cpu.txt
+  ```
+- Для GPU-сервера инференса (`inference_server.py` на LitServe) или локального инференса (`INFERENCE_MODE=local`):
+  ```bash
+  pip install -r requirements-gpu.txt
+  ```
 
-Основные зависимости: `pymupdf>=1.23.0`, `opencv-python>=4.8.0`, `numpy>=1.24.0`, `scipy>=1.10.0`, `easyocr`, `torch`, `ultralytics`, `Pillow`.
+Подробная инструкция по развёртыванию CPU (Docker/k8s) ↔ LiteLLM ↔ GPU (Mac LitServe) приведена в [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Запуск
 

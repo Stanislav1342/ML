@@ -1,8 +1,5 @@
-pymupdf>=1.23.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-scipy>=1.10.0
-easyocr
-torch
-ultralytics
-Pillow
+# CPU-сервис (Kubernetes / review_service.py в режиме INFERENCE_MODE=http):
+-r requirements-cpu.txt
+# Для GPU-сервера инференса на Mac (inference_server.py) или локального инференса (INFERENCE_MODE=local)
+# устанавливайте зависимости из requirements-gpu.txt:
+#   pip install -r requirements-gpu.txt
