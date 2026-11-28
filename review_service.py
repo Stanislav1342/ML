@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 from datetime import datetime, timedelta
 import hmac
 from http import HTTPStatus
@@ -12,6 +13,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
 import uuid
@@ -20,7 +22,18 @@ import zipfile
 import fitz
 from PIL import Image, ImageDraw
 
-from pipeline import BBox, CLASS_NAMES, Detection, Pipeline, Window, get_cyrillic_font
+from pipeline import (
+    BBox,
+    CLASS_NAMES,
+    DEFAULT_MAX_PDF_PAGES,
+    Detection,
+    Pipeline,
+    Window,
+    get_cyrillic_font,
+    get_large_pdf_policy,
+    get_max_pdf_pages,
+)
+from state_store import SQLiteStateStore, StateStore
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("review_service")
@@ -29,12 +42,12 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = PROJECT_DIR / "review_data"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-SERVICE_VERSION = "1.4.1"
+SERVICE_VERSION = "1.5.0"
 
 MAX_UPLOAD_BYTES = 600 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
-MAX_SESSION_PAGES = 3500
-DEFAULT_MAX_PAGES = 3500
+MAX_SESSION_PAGES = DEFAULT_MAX_PDF_PAGES
+DEFAULT_MAX_PAGES = DEFAULT_MAX_PDF_PAGES
 WINDOW_CROP_PADDING = 40
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -556,16 +569,57 @@ def _to_yolo_line(bbox: List[float], img_w: int, img_h: int, cls_id: int) -> Opt
     return f"{cls_id} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}"
 
 
+def _get_max_pdf_pages() -> int:
+    return get_max_pdf_pages()
+
+
+def _get_large_pdf_policy() -> str:
+    return get_large_pdf_policy()
+
+
+def _get_job_workers(override: Optional[int] = None) -> int:
+    if override is not None:
+        return max(1, min(8, int(override)))
+    raw = os.getenv("JOB_WORKERS", "2").strip()
+    try:
+        return max(1, min(8, int(raw)))
+    except ValueError:
+        return 2
+
+
+def _get_max_job_attempts() -> int:
+    raw = os.getenv("MAX_JOB_ATTEMPTS", "2").strip()
+    try:
+        return max(1, min(10, int(raw)))
+    except ValueError:
+        return 2
+
+
+def _new_job_id() -> str:
+    return f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+
 class ReviewService:
     """Сервис интерактивного разбора маршрутных листов и очереди дообучения."""
 
-    def __init__(self, data_dir: Optional[Path] = None, pipeline: Optional[Pipeline] = None):
+    def __init__(
+        self,
+        data_dir: Optional[Path] = None,
+        pipeline: Optional[Pipeline] = None,
+        state_store: Optional[StateStore] = None,
+        start_workers: bool = True,
+        job_workers: Optional[int] = None,
+    ):
         self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self.sessions_dir = self.data_dir / "sessions"
+        self.jobs_dir = self.data_dir / "jobs"
+        self.tmp_dir = self.data_dir / "tmp"
         self.quarantine_dir = self.data_dir / "quarantine"
         self.exports_dir = self.data_dir / "exports"
         for folder in (
             self.sessions_dir,
+            self.jobs_dir,
+            self.tmp_dir,
             self.quarantine_dir / "pending",
             self.quarantine_dir / "approved",
             self.quarantine_dir / "rejected",
@@ -574,12 +628,170 @@ class ReviewService:
             folder.mkdir(parents=True, exist_ok=True)
 
         self._pipeline = pipeline
+        self._pipeline_injected = pipeline is not None
         self._pipeline_init_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._quarantine_lock = threading.Lock()
         self._sessions_cleanup_lock = threading.Lock()
         self._session_locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+
+        self._health_cache_lock = threading.Lock()
+        self._health_cache_ts = 0.0
+        self._health_cache_result: Optional[Tuple[bool, str]] = None
+
+        self.store: StateStore = state_store or SQLiteStateStore(self.data_dir / "state.db")
+        if hasattr(self.store, "migrate_from_disk"):
+            migrated = self.store.migrate_from_disk(self.sessions_dir, self.quarantine_dir)
+            if migrated.get("sessions") or migrated.get("quarantine"):
+                logger.info(
+                    f"Миграция в SQLite завершена: сессий={migrated.get('sessions', 0)}, "
+                    f"карантин={migrated.get('quarantine', 0)}."
+                )
+        self._recover_stuck_jobs_on_startup()
+
+        self._stop_event = threading.Event()
+        self._job_wakeup = threading.Event()
+        self._workers: List[threading.Thread] = []
+        if start_workers:
+            num_workers = _get_job_workers(job_workers)
+            for idx in range(num_workers):
+                t = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"ml-job-worker-{idx + 1}",
+                    daemon=True,
+                )
+                t.start()
+                self._workers.append(t)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Корректно останавливает фоновые воркеры и закрывает StateStore."""
+        self._stop_event.set()
+        self._job_wakeup.set()
+        for t in self._workers:
+            t.join(timeout=timeout)
+        self.store.close()
+
+    def _recover_stuck_jobs_on_startup(self) -> None:
+        """Восстанавливает задачи, оставшиеся в 'running' после аварийного завершения процесса."""
+        recovered = self.store.recover_stuck_jobs(max_attempts=_get_max_job_attempts())
+        for job in recovered.get("requeued", []):
+            sid = job["session_id"]
+            lock = self._get_session_lock(sid)
+            with lock:
+                ses = self.store.get_session(sid)
+                if ses is not None:
+                    ses["status"] = "queued"
+                    ses["stage"] = "queued"
+                    ses["progress"] = 0
+                    ses["job_status"] = "queued"
+                    ses["error"] = None
+                    self.store.save_session(sid, ses)
+            logger.warning(f"Задача {job['job_id']} (сессия {sid}) возвращена в очередь после рестарта.")
+
+        for job in recovered.get("failed", []):
+            sid = job["session_id"]
+            lock = self._get_session_lock(sid)
+            with lock:
+                ses = self.store.get_session(sid)
+                if ses is not None:
+                    ses["status"] = "error"
+                    ses["stage"] = "error"
+                    ses["job_status"] = "failed"
+                    ses["error"] = job.get("error") or "Задача прервана аварийным завершением процесса."
+                    self.store.save_session(sid, ses)
+            logger.error(f"Задача {job['job_id']} (сессия {sid}) переведена в failed: {job.get('error')}")
+
+    def _worker_loop(self) -> None:
+        """Постоянный фоновый воркер, забирающий задачи из StateStore."""
+        while not self._stop_event.is_set():
+            try:
+                job = self.store.claim_next_job()
+            except Exception as exc:
+                logger.exception(f"Ошибка чтения очереди задач из StateStore: {exc}")
+                self._job_wakeup.wait(timeout=0.5)
+                self._job_wakeup.clear()
+                continue
+
+            if job is None:
+                self._job_wakeup.wait(timeout=0.25)
+                self._job_wakeup.clear()
+                continue
+
+            try:
+                if job.get("job_type") == "batch":
+                    self._run_batch_session_worker(job["session_id"], job=job)
+                else:
+                    self._run_single_job(job)
+            except Exception as exc:
+                logger.exception(f"Необработанная ошибка воркера для задачи {job.get('job_id')}: {exc}")
+
+    @staticmethod
+    def _get_inference_mode() -> str:
+        mode = os.getenv("INFERENCE_MODE", "local").strip().lower()
+        return mode if mode in ("local", "http") else "local"
+
+    def _inference_guard(self):
+        """Сериализует инференс только для реального локального PyTorch/MPS бэкенда."""
+        if not self._pipeline_injected and self._get_inference_mode() == "local":
+            return self._inference_lock
+        return contextlib.nullcontext()
+
+    def _probe_inference_backend(self) -> Tuple[bool, str]:
+        """Быстро проверяет доступность инференс-бэкенда и возвращает (ok, weights_version)."""
+        now = time.monotonic()
+        with self._health_cache_lock:
+            if self._health_cache_result is not None and (now - self._health_cache_ts) < 5.0:
+                return self._health_cache_result
+
+        mode = self._get_inference_mode()
+        ok = False
+        weights_ver = "unknown"
+
+        try:
+            if self._pipeline is not None:
+                backend = getattr(self._pipeline, "backend", None)
+                if backend is not None and hasattr(backend, "get_health"):
+                    try:
+                        info = backend.get_health(timeout_sec=2.0, retries=1)
+                    except TypeError:
+                        info = backend.get_health()
+                    ok = str(info.get("status", "ok")).lower() == "ok"
+                    weights_ver = str(info.get("weights_version") or getattr(backend, "weights_version", "unknown"))
+                else:
+                    ok = True
+                    weights_ver = "injected"
+            elif mode == "http":
+                base_url = os.getenv("INFERENCE_BASE_URL", "").strip()
+                if not base_url:
+                    ok = False
+                    weights_ver = "remote:unconfigured"
+                else:
+                    from inference_backend import HttpInferenceBackend
+                    probe = HttpInferenceBackend(timeout_sec=2.0, retries=1)
+                    info = probe.get_health(timeout_sec=2.0, retries=1)
+                    ok = str(info.get("status", "ok")).lower() == "ok"
+                    weights_ver = str(info.get("weights_version") or probe.weights_version)
+            else:
+                manifest_path = PROJECT_DIR / "weights_manifest.json"
+                if manifest_path.is_file():
+                    manifest = _read_json(manifest_path)
+                    weights_ver = str(manifest.get("weights_version") or "local:unknown")
+                    models = manifest.get("models") or {}
+                    ok = all((PROJECT_DIR / str(m.get("file", ""))).is_file() for m in models.values()) if models else False
+                else:
+                    yolo_ok = (PROJECT_DIR / "Новые веса" / "best_clean.pt").is_file()
+                    cls_ok = (PROJECT_DIR / "Новые веса" / "best_digit_classifier.pt").is_file()
+                    ok = yolo_ok and cls_ok
+                    weights_ver = "local:unverified"
+        except Exception:
+            ok = False
+            weights_ver = "remote:unavailable" if mode == "http" else "local:error"
+
+        with self._health_cache_lock:
+            self._health_cache_ts = now
+            self._health_cache_result = (ok, weights_ver)
+        return ok, weights_ver
 
     def _get_session_lock(self, session_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -604,32 +816,63 @@ class ReviewService:
 
     def health_info(self) -> Dict[str, Any]:
         """Возвращает состояние сервиса и справочники допустимых классов."""
+        max_pages = _get_max_pdf_pages()
+        backend_ok, weights_ver = self._probe_inference_backend()
         return {
             "status": "ok",
             "version": SERVICE_VERSION,
             "models_loaded": self._pipeline is not None,
-            "max_session_pages": MAX_SESSION_PAGES,
+            "max_session_pages": max_pages,
             "max_upload_bytes": MAX_UPLOAD_BYTES,
             "class_names": list(CLASS_NAMES),
             "protected_labels": sorted(PROTECTED_LABELS),
             "editable_labels": sorted(EDITABLE_LABELS),
             "operator_add_labels": list(OPERATOR_ADD_LABELS),
             "digit_labels": sorted(DIGIT_LABELS),
+            "inference_mode": self._get_inference_mode(),
+            "inference_backend_ok": backend_ok,
+            "weights_version": weights_ver,
+            "max_pdf_pages": max_pages,
+            "large_pdf_policy": _get_large_pdf_policy(),
+            "state_store": self.store.backend_name,
+            "queue_depth": self.store.count_active_jobs(),
         }
 
     def _session_dir(self, session_id: str) -> Path:
         sid = _validate_id(session_id, "session_id")
         return _safe_subpath(self.sessions_dir, sid)
 
+    def _resolve_session_work_dir(self, session_data: Dict[str, Any]) -> Path:
+        """Возвращает рабочий каталог задачи: jobs/<job_id> или legacy sessions/<session_id>."""
+        job_id = session_data.get("job_id")
+        if job_id:
+            jid = _validate_id(str(job_id), "job_id")
+            return _safe_subpath(self.jobs_dir, jid)
+        return self._session_dir(session_data["session_id"])
+
     def _load_session(self, session_id: str) -> Dict[str, Any]:
-        session_file = self._session_dir(session_id) / "session.json"
-        if not session_file.exists():
+        sid = _validate_id(session_id, "session_id")
+        data = self.store.get_session(sid)
+        if data is None:
             raise ServiceError(HTTPStatus.NOT_FOUND, f"Сессия '{_sanitize_log(session_id)}' не найдена.")
-        return _read_json(session_file)
+        return data
 
     def _save_session(self, session_id: str, session_data: Dict[str, Any]) -> None:
-        session_file = self._session_dir(session_id) / "session.json"
-        _atomic_write_json(session_file, session_data)
+        sid = _validate_id(session_id, "session_id")
+        self.store.save_session(sid, session_data)
+
+    def _delete_session_files(self, session_id: str, job_id: Optional[str]) -> None:
+        if job_id:
+            try:
+                jdir = _safe_subpath(self.jobs_dir, _validate_id(str(job_id), "job_id"))
+                shutil.rmtree(jdir, ignore_errors=True)
+            except ServiceError:
+                pass
+        try:
+            sdir = _safe_subpath(self.sessions_dir, _validate_id(session_id, "session_id"))
+            shutil.rmtree(sdir, ignore_errors=True)
+        except ServiceError:
+            pass
 
     def _cleanup_sessions(self) -> int:
         """Удаляет старые завершённые сессии (лимит MAX_KEEP_SESSIONS) и зависшие collecting (>24ч)."""
@@ -637,36 +880,30 @@ class ReviewService:
         now = datetime.now()
         collecting_max_age = timedelta(hours=COLLECTING_MAX_HOURS)
         with self._sessions_cleanup_lock:
-            if not self.sessions_dir.exists():
-                return 0
-            entries: List[Tuple[str, str, Path]] = []
+            headers = self.store.list_session_headers()
+            finished_entries: List[Tuple[str, str, Optional[str]]] = []
             active_count = 0
-            for entry in self.sessions_dir.iterdir():
-                if not entry.is_dir():
-                    continue
-                meta_path = entry / "session.json"
-                if not meta_path.is_file():
-                    continue
-                try:
-                    data = _read_json(meta_path)
-                    status_val = data.get("status", "unknown")
-                    created_at = str(data.get("created_at") or "")
-                    if status_val == "collecting":
-                        created_dt = _parse_iso_datetime(created_at, entry.stat().st_mtime)
-                        if now - created_dt > collecting_max_age:
-                            shutil.rmtree(entry, ignore_errors=True)
-                            removed += 1
-                    elif status_val in ("queued", "running"):
-                        active_count += 1
-                    else:
-                        entries.append((created_at, entry.name, entry))
-                except Exception:
-                    continue
+            for hdr in headers:
+                sid = str(hdr["session_id"])
+                jid = hdr.get("job_id")
+                status_val = str(hdr.get("status") or "unknown")
+                created_at = str(hdr.get("created_at") or "")
+                if status_val == "collecting":
+                    created_dt = _parse_iso_datetime(created_at, now.timestamp())
+                    if now - created_dt > collecting_max_age:
+                        self.store.delete_session(sid)
+                        self._delete_session_files(sid, jid)
+                        removed += 1
+                elif status_val in ("queued", "running"):
+                    active_count += 1
+                else:
+                    finished_entries.append((created_at, sid, jid))
 
-            entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            finished_entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
             keep_finished = max(0, MAX_KEEP_SESSIONS - active_count)
-            for _, _, old_dir in entries[keep_finished:]:
-                shutil.rmtree(old_dir, ignore_errors=True)
+            for _, old_sid, old_jid in finished_entries[keep_finished:]:
+                self.store.delete_session(old_sid)
+                self._delete_session_files(old_sid, old_jid)
                 removed += 1
         if removed:
             logger.info(f"Автоочистка сессий: удалено старых сессий={removed} (лимит={MAX_KEEP_SESSIONS}).")
@@ -701,6 +938,7 @@ class ReviewService:
 
                 if now - ref_dt > max_age:
                     shutil.rmtree(entry, ignore_errors=True)
+                    self.store.delete_quarantine_item(entry.name)
                     removed[bucket] += 1
 
         if removed["pending"] or removed["rejected"]:
@@ -771,16 +1009,26 @@ class ReviewService:
         pdf_bytes: Optional[bytes] = None,
         uploaded_temp_path: Optional[Path] = None,
         filename: str = "upload.pdf",
-        max_pages: int = DEFAULT_MAX_PAGES,
+        max_pages: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Создаёт сессию разбора и запускает фоновую обработку PDF."""
-        if not (1 <= max_pages <= MAX_SESSION_PAGES):
-            raise ServiceError(HTTPStatus.BAD_REQUEST, f"Параметр max_pages должен быть от 1 до {MAX_SESSION_PAGES}.")
+        """Создаёт сессию разбора, изолирует файлы по job_id и ставит задачу в SQLite-очередь."""
+        configured_max = _get_max_pdf_pages()
+        if max_pages is None:
+            effective_max = configured_max
+        else:
+            if not (1 <= int(max_pages) <= configured_max):
+                raise ServiceError(HTTPStatus.BAD_REQUEST, f"Параметр max_pages должен быть от 1 до {configured_max}.")
+            effective_max = int(max_pages)
 
+        policy = _get_large_pdf_policy()
         session_id = f"ses_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        ses_dir = self.sessions_dir / session_id
+        job_id = _new_job_id()
+        ses_dir = _safe_subpath(self.jobs_dir, job_id)
         pages_dir = ses_dir / "pages"
-        pages_dir.mkdir(parents=True, exist_ok=True)
+        crops_dir = ses_dir / "crops"
+        outputs_dir = ses_dir / "outputs"
+        for d in (pages_dir, crops_dir, outputs_dir):
+            d.mkdir(parents=True, exist_ok=True)
         local_pdf = ses_dir / "input.pdf"
 
         if uploaded_temp_path is not None:
@@ -826,16 +1074,49 @@ class ReviewService:
             shutil.rmtree(ses_dir, ignore_errors=True)
             raise ServiceError(HTTPStatus.BAD_REQUEST, "Не передан pdf_path или PDF-содержимое.")
 
+        try:
+            with fitz.open(local_pdf) as doc:
+                actual_pages = len(doc)
+        except Exception as exc:
+            shutil.rmtree(ses_dir, ignore_errors=True)
+            raise ServiceError(HTTPStatus.BAD_REQUEST, "Загруженный файл не является корректным PDF.") from exc
+
+        if actual_pages <= 0:
+            shutil.rmtree(ses_dir, ignore_errors=True)
+            raise ServiceError(HTTPStatus.BAD_REQUEST, "В загруженном PDF нет страниц для анализа.")
+
+        truncated = False
+        truncation_warning = None
+        planned_pages = actual_pages
+        if actual_pages > effective_max:
+            if policy == "reject":
+                shutil.rmtree(ses_dir, ignore_errors=True)
+                raise ServiceError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Превышен лимит страниц: в документе {actual_pages} стр., максимум {effective_max} стр.",
+                )
+            truncated = True
+            planned_pages = effective_max
+            truncation_warning = (
+                f"Превышен лимит страниц: в документе {actual_pages} стр., максимум {effective_max} стр. "
+                f"Обработаны первые {effective_max} стр."
+            )
+
         safe_source_name = _sanitize_log(source_name, 120) or "document.pdf"
         initial_state = {
             "session_id": session_id,
+            "job_id": job_id,
+            "job_status": "queued",
             "source_filename": safe_source_name,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "status": "queued",
             "stage": "queued",
             "progress": 0,
             "processed_pages": 0,
-            "total_pages": 0,
+            "total_pages": actual_pages,
+            "planned_pages": planned_pages,
+            "truncated": truncated,
+            "truncation_warning": truncation_warning,
             "finalized": False,
             "finalized_at": None,
             "error": None,
@@ -853,14 +1134,22 @@ class ReviewService:
             },
         }
         self._save_session(session_id, initial_state)
-        self._cleanup_sessions()
-
-        worker = threading.Thread(
-            target=self._run_session_worker,
-            args=(session_id, local_pdf, pages_dir, max_pages),
-            daemon=True,
+        self.store.enqueue_job(
+            job_id=job_id,
+            session_id=session_id,
+            job_type="single",
+            payload={
+                "pdf_path": str(local_pdf),
+                "pages_dir": str(pages_dir),
+                "max_pages": effective_max,
+                "policy": policy,
+                "actual_pages": actual_pages,
+                "truncated": truncated,
+                "truncation_warning": truncation_warning,
+            },
         )
-        worker.start()
+        self._cleanup_sessions()
+        self._job_wakeup.set()
         return self.get_session_status(session_id)
 
     def create_batch_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -877,24 +1166,28 @@ class ReviewService:
                 HTTPStatus.BAD_REQUEST,
                 f"Поле 'files_total' должно быть целым числом от {BATCH_MIN_FILES} до {BATCH_MAX_FILES}.",
             )
-        max_pages = payload.get("max_pages", DEFAULT_MAX_PAGES)
+        configured_max = _get_max_pdf_pages()
+        max_pages = payload.get("max_pages", configured_max)
         if (
             not isinstance(max_pages, int)
             or isinstance(max_pages, bool)
-            or not (1 <= max_pages <= MAX_SESSION_PAGES)
+            or not (1 <= max_pages <= configured_max)
         ):
             raise ServiceError(
                 HTTPStatus.BAD_REQUEST,
-                f"Параметр max_pages должен быть от 1 до {MAX_SESSION_PAGES}.",
+                f"Параметр max_pages должен быть от 1 до {configured_max}.",
             )
 
         session_id = f"ses_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        ses_dir = self.sessions_dir / session_id
-        (ses_dir / "pages").mkdir(parents=True, exist_ok=True)
-        (ses_dir / "files").mkdir(parents=True, exist_ok=True)
+        job_id = _new_job_id()
+        job_dir = _safe_subpath(self.jobs_dir, job_id)
+        for sub in ("pages", "files", "crops", "outputs"):
+            (job_dir / sub).mkdir(parents=True, exist_ok=True)
 
         initial_state = {
             "session_id": session_id,
+            "job_id": job_id,
+            "job_status": "collecting",
             "is_batch": True,
             "source_filename": f"Пакет: {files_total} файлов",
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -903,6 +1196,8 @@ class ReviewService:
             "progress": 0,
             "processed_pages": 0,
             "total_pages": 0,
+            "truncated": False,
+            "truncation_warning": None,
             "files_total": files_total,
             "files_received": 0,
             "current_file_idx": 0,
@@ -930,6 +1225,7 @@ class ReviewService:
         self._cleanup_sessions()
         return {
             "session_id": session_id,
+            "job_id": job_id,
             "status": "collecting",
             "files_total": files_total,
             "files_received": 0,
@@ -963,8 +1259,8 @@ class ReviewService:
                 raise ServiceError(HTTPStatus.CONFLICT, "Все файлы пакета уже загружены.")
 
             file_idx = len(uploaded)
-            ses_dir = self._session_dir(session_id)
-            files_dir = ses_dir / "files"
+            work_dir = self._resolve_session_work_dir(state)
+            files_dir = work_dir / "files"
             files_dir.mkdir(parents=True, exist_ok=True)
             rel_name = f"input_{file_idx:03d}.pdf"
             shutil.move(str(uploaded_temp_path), str(files_dir / rel_name))
@@ -993,7 +1289,9 @@ class ReviewService:
         return f"Пакет: {len(uploaded_files)} файлов ({first}, ...)"
 
     def start_batch_session(self, session_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Переводит пакетную сессию из collecting в queued и запускает последовательную обработку файлов."""
+        """Переводит пакетную сессию из collecting в queued и ставит задачу в SQLite-очередь."""
+        policy = _get_large_pdf_policy()
+        configured_max = _get_max_pdf_pages()
         lock = self._get_session_lock(session_id)
         with lock:
             state = self._load_session(session_id)
@@ -1003,39 +1301,91 @@ class ReviewService:
             if not uploaded:
                 raise ServiceError(HTTPStatus.BAD_REQUEST, "Не загружен ни один PDF-файл для анализа.")
 
+            work_dir = self._resolve_session_work_dir(state)
+            files_dir = work_dir / "files"
+            total_pages_actual = 0
+            for item in uploaded:
+                pdf_path = files_dir / item["stored_file"]
+                try:
+                    with fitz.open(pdf_path) as doc:
+                        total_pages_actual += len(doc)
+                except Exception as exc:
+                    raise ServiceError(
+                        HTTPStatus.BAD_REQUEST,
+                        f"Файл {item['filename']}: повреждённый или нечитаемый PDF",
+                    ) from exc
+
+            effective_max = min(int(state.get("max_pages", configured_max)), configured_max)
+            truncated = False
+            truncation_warning = None
+            if total_pages_actual > effective_max:
+                if policy == "reject":
+                    raise ServiceError(
+                        HTTPStatus.BAD_REQUEST,
+                        f"Превышен лимит страниц: в документе {total_pages_actual} стр., максимум {effective_max} стр.",
+                    )
+                truncated = True
+                truncation_warning = (
+                    f"Превышен лимит страниц: в документе {total_pages_actual} стр., максимум {effective_max} стр. "
+                    f"Обработаны первые {effective_max} стр."
+                )
+
+            job_id = state.get("job_id") or _new_job_id()
+            state["job_id"] = job_id
+            state["job_status"] = "queued"
             state["files_total"] = len(uploaded)
             state["files_received"] = len(uploaded)
             state["source_filename"] = self._format_batch_source_name(uploaded)
             state["status"] = "queued"
             state["stage"] = "queued"
             state["progress"] = 0
+            state["total_pages"] = total_pages_actual
+            state["planned_pages"] = min(total_pages_actual, effective_max)
+            state["truncated"] = truncated
+            state["truncation_warning"] = truncation_warning
             self._save_session(session_id, state)
 
-        worker = threading.Thread(
-            target=self._run_batch_session_worker,
-            args=(session_id,),
-            daemon=True,
+        self.store.enqueue_job(
+            job_id=job_id,
+            session_id=session_id,
+            job_type="batch",
+            payload={
+                "max_pages": effective_max,
+                "policy": policy,
+                "actual_pages": total_pages_actual,
+                "truncated": truncated,
+                "truncation_warning": truncation_warning,
+            },
         )
-        worker.start()
+        self._job_wakeup.set()
         return self.get_session_status(session_id)
 
-    def _run_batch_session_worker(self, session_id: str) -> None:
+    def _run_batch_session_worker(self, session_id: str, job: Optional[Dict[str, Any]] = None) -> None:
         """Последовательно анализирует все PDF-файлы пакетной сессии без склейки МЛ между файлами."""
         lock = self._get_session_lock(session_id)
         current_fname = ""
+        job_id = job["job_id"] if job else None
         try:
             with lock:
                 state = self._load_session(session_id)
+                if job_id is None:
+                    job_id = state.get("job_id")
                 uploaded = list(state.get("uploaded_files") or [])
-                max_pages = int(state.get("max_pages", DEFAULT_MAX_PAGES))
+                max_pages = int(state.get("max_pages", _get_max_pdf_pages()))
+                truncated = bool(state.get("truncated", False))
+                truncation_warning = state.get("truncation_warning")
                 state["status"] = "running"
+                state["job_status"] = "running"
                 state["stage"] = "init"
                 state["progress"] = 2
                 self._save_session(session_id, state)
 
-            ses_dir = self._session_dir(session_id)
+            ses_dir = self._resolve_session_work_dir(state)
             pages_dir = ses_dir / "pages"
             files_dir = ses_dir / "files"
+            outputs_dir = ses_dir / "outputs"
+            pages_dir.mkdir(parents=True, exist_ok=True)
+            outputs_dir.mkdir(parents=True, exist_ok=True)
 
             file_page_counts: List[int] = []
             for item in uploaded:
@@ -1047,13 +1397,15 @@ class ReviewService:
                 except Exception as exc:
                     raise RuntimeError(f"Файл {current_fname}: повреждённый или нечитаемый PDF") from exc
 
-            planned_total = min(max_pages, sum(file_page_counts))
+            actual_total = sum(file_page_counts)
+            planned_total = min(max_pages, actual_total)
             if planned_total <= 0:
                 raise RuntimeError("В загруженных PDF-файлах нет страниц для анализа.")
 
             with lock:
                 cur = self._load_session(session_id)
-                cur["total_pages"] = planned_total
+                cur["total_pages"] = actual_total if truncated else planned_total
+                cur["planned_pages"] = planned_total
                 self._save_session(session_id, cur)
 
             waybills: List[Dict[str, Any]] = []
@@ -1086,20 +1438,21 @@ class ReviewService:
                         cur_st["stage"] = stage
                         cur_st["progress"] = min(96, pct)
                         cur_st["processed_pages"] = overall_done
-                        cur_st["total_pages"] = planned_total
+                        cur_st["total_pages"] = actual_total if truncated else planned_total
                         self._save_session(session_id, cur_st)
 
                 tmp_file_dir = pages_dir / f"_tmp_f{f_idx:03d}"
                 tmp_file_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     try:
-                        with self._inference_lock:
+                        with self._inference_guard():
                             segments = self.pipeline.analyze_pdf_segments(
                                 str(pdf_path),
                                 str(tmp_file_dir),
                                 max_pages=remaining_budget,
                                 progress_callback=on_progress,
                                 image_ext=".jpg",
+                                large_pdf_policy="partial",
                             )
                     except Exception as exc:
                         raise RuntimeError(f"Файл {current_fname}: ошибка при анализе PDF") from exc
@@ -1207,18 +1560,30 @@ class ReviewService:
                 pages_done_before += expected_for_file if file_pages_count == 0 else file_pages_count
                 source_files_info.append({"filename": current_fname, "pages": file_pages_count})
 
+            final_job_status = "partial" if truncated else "completed"
             with lock:
                 final_state = self._load_session(session_id)
                 final_state["status"] = "ready"
+                final_state["job_status"] = final_job_status
                 final_state["stage"] = "done"
                 final_state["progress"] = 100
                 final_state["processed_pages"] = global_idx
-                final_state["total_pages"] = global_idx
+                final_state["total_pages"] = actual_total if truncated else global_idx
+                final_state["truncated"] = truncated
+                final_state["truncation_warning"] = truncation_warning
                 final_state["source_files"] = source_files_info
                 final_state["waybills"] = waybills
                 final_state["pages"] = pages
                 self._refresh_session_metrics(final_state)
                 self._save_session(session_id, final_state)
+
+            if job_id:
+                self.store.update_job_status(job_id, final_job_status, error=None, finished=True)
+            try:
+                rep_txt, rep_name = self.build_report_text(session_id)
+                (outputs_dir / rep_name).write_text(rep_txt, encoding="utf-8")
+            except Exception:
+                pass
 
             self._cleanup_sessions()
             logger.info(f"Пакетная сессия {session_id} готова: файлов={len(source_files_info)}, страниц={global_idx}, МЛ={len(waybills)}")
@@ -1233,21 +1598,51 @@ class ReviewService:
                 except Exception:
                     err_state = {"session_id": session_id}
                 err_state["status"] = "error"
+                err_state["job_status"] = "failed"
                 err_state["stage"] = "error"
                 err_state["error"] = err_msg
                 self._save_session(session_id, err_state)
+            if job_id:
+                self.store.update_job_status(job_id, "failed", error=err_msg, finished=True)
             self._cleanup_sessions()
 
-    def _run_session_worker(self, session_id: str, pdf_file: Path, pages_dir: Path, max_pages: int) -> None:
+    def _run_single_job(self, job: Dict[str, Any]) -> None:
+        payload = job.get("payload") or {}
+        session_id = job["session_id"]
+        pdf_file = Path(payload["pdf_path"])
+        pages_dir = Path(payload["pages_dir"])
+        max_pages = int(payload.get("max_pages", _get_max_pdf_pages()))
+        self._run_session_worker(session_id, pdf_file, pages_dir, max_pages, job=job)
+
+    def _run_session_worker(
+        self,
+        session_id: str,
+        pdf_file: Path,
+        pages_dir: Path,
+        max_pages: int,
+        job: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Выполняет ML-анализ PDF в фоне и сохраняет структуру сессии."""
         lock = self._get_session_lock(session_id)
+        job_id = job["job_id"] if job else None
         try:
             with lock:
                 state = self._load_session(session_id)
+                if job_id is None:
+                    job_id = state.get("job_id")
+                truncated = bool(state.get("truncated", False))
+                truncation_warning = state.get("truncation_warning")
+                actual_total = int(state.get("total_pages") or 0)
+                planned_total = int(state.get("planned_pages") or max_pages)
                 state["status"] = "running"
+                state["job_status"] = "running"
                 state["stage"] = "init"
                 state["progress"] = 2
                 self._save_session(session_id, state)
+
+            ses_dir = self._resolve_session_work_dir(state)
+            outputs_dir = ses_dir / "outputs"
+            outputs_dir.mkdir(parents=True, exist_ok=True)
 
             def on_progress(done: int, total: int, stage: str) -> None:
                 ratio = done / max(1, total)
@@ -1262,16 +1657,17 @@ class ReviewService:
                     cur["stage"] = stage
                     cur["progress"] = min(96, pct)
                     cur["processed_pages"] = done
-                    cur["total_pages"] = total
+                    cur["total_pages"] = actual_total if (truncated and actual_total > 0) else total
                     self._save_session(session_id, cur)
 
-            with self._inference_lock:
+            with self._inference_guard():
                 segments = self.pipeline.analyze_pdf_segments(
                     str(pdf_file),
                     str(pages_dir),
                     max_pages=max_pages,
                     progress_callback=on_progress,
                     image_ext=".jpg",
+                    large_pdf_policy="partial",
                 )
 
             waybills: List[Dict[str, Any]] = []
@@ -1366,65 +1762,60 @@ class ReviewService:
                     "reviewed_pages": 0,
                 })
 
+            final_job_status = "partial" if truncated else "completed"
             with lock:
                 final_state = self._load_session(session_id)
                 final_state["status"] = "ready"
+                final_state["job_status"] = final_job_status
                 final_state["stage"] = "done"
                 final_state["progress"] = 100
                 final_state["processed_pages"] = global_idx
-                final_state["total_pages"] = global_idx
+                final_state["total_pages"] = actual_total if (truncated and actual_total > 0) else global_idx
+                final_state["truncated"] = truncated
+                final_state["truncation_warning"] = truncation_warning
                 final_state["waybills"] = waybills
                 final_state["pages"] = pages
                 self._refresh_session_metrics(final_state)
                 self._save_session(session_id, final_state)
 
+            if job_id:
+                self.store.update_job_status(job_id, final_job_status, error=None, finished=True)
+            try:
+                rep_txt, rep_name = self.build_report_text(session_id)
+                (outputs_dir / rep_name).write_text(rep_txt, encoding="utf-8")
+            except Exception:
+                pass
+
             self._cleanup_sessions()
             logger.info(f"Сессия {session_id} готова: страниц={global_idx}, МЛ={len(waybills)}")
         except Exception as exc:
             logger.exception(f"Ошибка фоновой обработки сессии {session_id}: {exc}")
+            err_msg = "Ошибка при анализе PDF. Проверьте корректность файла и логи сервиса."
             with lock:
                 try:
                     err_state = self._load_session(session_id)
                 except Exception:
                     err_state = {"session_id": session_id}
                 err_state["status"] = "error"
+                err_state["job_status"] = "failed"
                 err_state["stage"] = "error"
-                err_state["error"] = "Ошибка при анализе PDF. Проверьте корректность файла и логи сервиса."
+                err_state["error"] = err_msg
                 self._save_session(session_id, err_state)
+            if job_id:
+                self.store.update_job_status(job_id, "failed", error=err_msg, finished=True)
             self._cleanup_sessions()
 
     def list_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Возвращает список последних сессий разбора с датой создания."""
-        items: List[Dict[str, Any]] = []
-        if not self.sessions_dir.exists():
-            return items
-        for entry in self.sessions_dir.iterdir():
-            meta_file = entry / "session.json"
-            if not meta_file.is_file():
-                continue
-            try:
-                data = _read_json(meta_file)
-                created_at = data.get("created_at") or datetime.fromtimestamp(meta_file.stat().st_mtime).isoformat(timespec="seconds")
-                items.append({
-                    "session_id": data["session_id"],
-                    "source_filename": data.get("source_filename", ""),
-                    "created_at": created_at,
-                    "status": data.get("status", "unknown"),
-                    "progress": data.get("progress", 0),
-                    "finalized": bool(data.get("finalized", False)),
-                    "finalized_at": data.get("finalized_at"),
-                    "summary": data.get("summary", {}),
-                })
-            except Exception:
-                continue
-        items.sort(key=lambda x: (x.get("created_at", ""), x.get("session_id", "")), reverse=True)
-        return items[:limit]
+        return self.store.list_sessions(limit=limit)
 
     def get_session_status(self, session_id: str) -> Dict[str, Any]:
         """Возвращает статус и прогресс сессии."""
         data = self._load_session(session_id)
         return {
             "session_id": data["session_id"],
+            "job_id": data.get("job_id"),
+            "job_status": data.get("job_status", data.get("status", "unknown")),
             "source_filename": data.get("source_filename", ""),
             "created_at": data.get("created_at", ""),
             "status": data.get("status", "unknown"),
@@ -1432,6 +1823,8 @@ class ReviewService:
             "progress": data.get("progress", 0),
             "processed_pages": data.get("processed_pages", 0),
             "total_pages": data.get("total_pages", 0),
+            "truncated": bool(data.get("truncated", False)),
+            "truncation_warning": data.get("truncation_warning"),
             "files_total": data.get("files_total", 1),
             "files_received": data.get("files_received", 1 if not data.get("is_batch") else 0),
             "current_file_idx": data.get("current_file_idx", 1 if data.get("status") in ("running", "ready") and not data.get("is_batch") else 0),
@@ -1444,18 +1837,18 @@ class ReviewService:
         }
 
     def delete_session(self, session_id: str) -> Dict[str, Any]:
-        """Удаляет завершённую сессию проверки с диска."""
+        """Удаляет завершённую сессию проверки из SQLite и с диска."""
         sid = _validate_id(session_id, "session_id")
         lock = self._get_session_lock(sid)
         with lock, self._sessions_cleanup_lock:
-            ses_dir = _safe_subpath(self.sessions_dir, sid)
-            session_file = ses_dir / "session.json"
-            if not session_file.exists():
+            data = self.store.get_session(sid)
+            if data is None:
                 raise ServiceError(HTTPStatus.NOT_FOUND, f"Сессия '{sid}' не найдена.")
-            data = _read_json(session_file)
             if data.get("status") in ("queued", "running"):
                 raise ServiceError(HTTPStatus.CONFLICT, "Нельзя удалить сессию во время выполнения анализа.")
-            shutil.rmtree(ses_dir, ignore_errors=True)
+            job_id = data.get("job_id")
+            self.store.delete_session(sid)
+            self._delete_session_files(sid, job_id)
             return {"deleted": True, "session_id": sid}
 
     def get_session(self, session_id: str) -> Dict[str, Any]:
@@ -1487,7 +1880,7 @@ class ReviewService:
         """Возвращает изображение полной страницы (оригинал или с текущими рамками)."""
         data = self._load_session(session_id)
         page, _ = self._find_page_and_window(data, page_id)
-        img_path = _safe_subpath(self._session_dir(session_id), "pages", _validate_filename(page["image_file"]))
+        img_path = _safe_subpath(self._resolve_session_work_dir(data), "pages", _validate_filename(page["image_file"]))
         if not img_path.exists():
             raise ServiceError(HTTPStatus.NOT_FOUND, "Изображение страницы не найдено.")
         if not annotated:
@@ -1503,7 +1896,7 @@ class ReviewService:
         """Возвращает вырезанное изображение окна аптеки по crop_rect."""
         data = self._load_session(session_id)
         page, win = self._find_page_and_window(data, page_id, window_idx)
-        img_path = _safe_subpath(self._session_dir(session_id), "pages", _validate_filename(page["image_file"]))
+        img_path = _safe_subpath(self._resolve_session_work_dir(data), "pages", _validate_filename(page["image_file"]))
         if not img_path.exists():
             raise ServiceError(HTTPStatus.NOT_FOUND, "Изображение страницы не найдено.")
         cx1, cy1, cx2, cy2 = win["crop_rect"]
@@ -1525,7 +1918,7 @@ class ReviewService:
                 break
         if target_el is None:
             raise ServiceError(HTTPStatus.NOT_FOUND, f"Элемент '{eid}' не найден.")
-        img_path = _safe_subpath(self._session_dir(session_id), "pages", _validate_filename(page["image_file"]))
+        img_path = _safe_subpath(self._resolve_session_work_dir(data), "pages", _validate_filename(page["image_file"]))
         bbox = BBox(*[float(v) for v in target_el["bbox"]])
         with Image.open(img_path) as im:
             rgb = im.convert("RGB")
@@ -1802,7 +2195,7 @@ class ReviewService:
             if session_data.get("status") != "ready":
                 raise ServiceError(HTTPStatus.CONFLICT, "Сессия ещё обрабатывается.")
             page, win = self._find_page_and_window(session_data, page_id, window_idx)
-            img_path = _safe_subpath(self._session_dir(session_id), "pages", _validate_filename(page["image_file"]))
+            img_path = _safe_subpath(self._resolve_session_work_dir(session_data), "pages", _validate_filename(page["image_file"]))
             page_w = int(page["width"])
             page_h = int(page["height"])
             elements: List[Dict[str, Any]] = win["elements"]
@@ -1986,7 +2379,7 @@ class ReviewService:
         allow_without_diff: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Записывает или обновляет страницу с правками разметки в карантин pending."""
-        ses_dir = self._session_dir(session_id)
+        ses_dir = self._resolve_session_work_dir(session_data)
         page_id = page["page_id"]
 
         window_diffs = []
@@ -2090,6 +2483,7 @@ class ReviewService:
             "export_batch": None,
         }
         _atomic_write_json(item_dir / "item.json", item_data)
+        self.store.save_quarantine_item(item_id, item_data)
         page["quarantine_item_id"] = item_id
         return {
             "item_id": item_id,
@@ -2209,49 +2603,48 @@ class ReviewService:
         items: List[Dict[str, Any]] = []
         with self._quarantine_lock:
             self._cleanup_quarantine_locked()
-            for bucket in buckets:
-                bucket_dir = self.quarantine_dir / bucket
-                if not bucket_dir.exists():
-                    continue
-                for entry in bucket_dir.iterdir():
-                    meta_path = entry / "item.json"
-                    if not meta_path.is_file():
-                        continue
-                    data = _read_json(meta_path)
-                    counts = {"added": 0, "deleted": 0, "relabeled": 0, "digit_fixed": 0}
-                    for wd in data.get("window_diffs", []):
-                        d = wd["diff"]
-                        counts["added"] += len(d.get("added", []))
-                        counts["deleted"] += len(d.get("deleted", []))
-                        counts["relabeled"] += len(d.get("relabeled", []))
-                        counts["digit_fixed"] += len(d.get("digit_fixed", []))
-                    items.append({
-                        "item_id": data["item_id"],
-                        "status": data["status"],
-                        "ml_number": data.get("ml_number", "Unknown"),
-                        "driver_name": data.get("driver_name", "Unknown"),
-                        "page_num": data.get("page_num", 1),
-                        "source_filename": data.get("source_filename", ""),
-                        "submitted_by": data.get("submitted_by", ""),
-                        "submitted_by_name": data.get("submitted_by_name", ""),
-                        "submitted_at": data.get("submitted_at", ""),
-                        "invariant_passed": data.get("invariant_passed", False),
-                        "admin_edited": bool(data.get("admin_edited", False)),
-                        "diff_counts": counts,
-                        "digit_crops_count": len(data.get("digit_crops", [])),
-                        "exported_at": data.get("exported_at"),
-                        "reviewed_by": data.get("reviewed_by"),
-                        "reviewed_at": data.get("reviewed_at"),
-                    })
+            raw_items = self.store.list_quarantine_items(status_filter)
+            for data in raw_items:
+                counts = {"added": 0, "deleted": 0, "relabeled": 0, "digit_fixed": 0}
+                for wd in data.get("window_diffs", []):
+                    d = wd["diff"]
+                    counts["added"] += len(d.get("added", []))
+                    counts["deleted"] += len(d.get("deleted", []))
+                    counts["relabeled"] += len(d.get("relabeled", []))
+                    counts["digit_fixed"] += len(d.get("digit_fixed", []))
+                items.append({
+                    "item_id": data["item_id"],
+                    "status": data["status"],
+                    "ml_number": data.get("ml_number", "Unknown"),
+                    "driver_name": data.get("driver_name", "Unknown"),
+                    "page_num": data.get("page_num", 1),
+                    "source_filename": data.get("source_filename", ""),
+                    "submitted_by": data.get("submitted_by", ""),
+                    "submitted_by_name": data.get("submitted_by_name", ""),
+                    "submitted_at": data.get("submitted_at", ""),
+                    "invariant_passed": data.get("invariant_passed", False),
+                    "admin_edited": bool(data.get("admin_edited", False)),
+                    "diff_counts": counts,
+                    "digit_crops_count": len(data.get("digit_crops", [])),
+                    "exported_at": data.get("exported_at"),
+                    "reviewed_by": data.get("reviewed_by"),
+                    "reviewed_at": data.get("reviewed_at"),
+                })
 
         items.sort(key=lambda x: x.get("submitted_at", ""), reverse=True)
         return items
 
     def get_quarantine_item(self, item_id: str) -> Dict[str, Any]:
         """Возвращает детальную карточку записи карантина."""
+        qid = _validate_id(item_id, "item_id")
         with self._quarantine_lock:
-            _, item_dir = self._locate_quarantine_item(item_id)
-            return _read_json(item_dir / "item.json")
+            cached = self.store.get_quarantine_item(qid)
+            if cached is not None:
+                return cached
+            _, item_dir = self._locate_quarantine_item(qid)
+            data = _read_json(item_dir / "item.json")
+            self.store.save_quarantine_item(qid, data)
+            return data
 
     def get_quarantine_image_bytes(
         self,
@@ -2314,6 +2707,7 @@ class ReviewService:
                 _atomic_write_json(dst_dir / "item.json", data)
             else:
                 _atomic_write_json(src_dir / "item.json", data)
+            self.store.save_quarantine_item(data["item_id"], data)
 
             return {
                 "item_id": data["item_id"],
@@ -2433,6 +2827,7 @@ class ReviewService:
             data["admin_edited_at"] = datetime.now().isoformat(timespec="seconds")
 
             _atomic_write_json(item_dir / "item.json", data)
+            self.store.save_quarantine_item(data["item_id"], data)
             return data
 
     def export_approved(self, include_exported: bool = False) -> Dict[str, Any]:
@@ -2572,6 +2967,7 @@ class ReviewService:
 
             for entry_dir in exported_dirs:
                 shutil.rmtree(entry_dir, ignore_errors=True)
+                self.store.delete_quarantine_item(entry_dir.name)
 
             self._cleanup_quarantine_locked()
             return {
@@ -2635,6 +3031,9 @@ class ReviewService:
         valid_list, error_list = self._classify_waybills(data)
 
         lines: List[str] = []
+        if data.get("truncated") and data.get("truncation_warning"):
+            lines.append(f"ВНИМАНИЕ: {data['truncation_warning']}")
+            lines.append("")
         source_files = data.get("source_files") or []
         if len(source_files) > 1:
             lines.append(f"ПАКЕТ ФАЙЛОВ ({len(source_files)}):")
@@ -2667,7 +3066,7 @@ class ReviewService:
         if data.get("status") != "ready":
             raise ServiceError(HTTPStatus.CONFLICT, "Сессия ещё обрабатывается.")
 
-        ses_dir = self._session_dir(session_id)
+        ses_dir = self._resolve_session_work_dir(data)
         is_batch = bool(data.get("is_batch"))
         default_input_pdf = ses_dir / "input.pdf"
         if not is_batch and not default_input_pdf.is_file():
@@ -2679,7 +3078,9 @@ class ReviewService:
         report_txt, report_name = self.build_report_text(session_id)
         src_stem = _safe_file_stem(data.get("source_filename", "ml"))
 
-        tmp_fd, tmp_zip_str = tempfile.mkstemp(prefix=f"export_{session_id}_", suffix=".zip", dir=str(self.exports_dir))
+        outputs_dir = ses_dir / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_zip_str = tempfile.mkstemp(prefix=f"export_{session_id}_", suffix=".zip", dir=str(outputs_dir))
         os.close(tmp_fd)
         tmp_zip_path = Path(tmp_zip_str)
 
@@ -2745,7 +3146,7 @@ class ReviewService:
     def build_archive_pdf_bytes(self, session_id: str) -> Tuple[bytes, str]:
         """Собирает обновлённый многостраничный PDF со свежими рамками после проверки."""
         data = self._load_session(session_id)
-        ses_dir = self._session_dir(session_id)
+        ses_dir = self._resolve_session_work_dir(data)
         rendered_pages: List[Image.Image] = []
         for page in data.get("pages", []):
             img_path = _safe_subpath(ses_dir, "pages", _validate_filename(page["image_file"]))
@@ -2839,7 +3240,7 @@ def _make_handler(service: ReviewService, api_token: Optional[str]):
             length = self._parse_content_length(MAX_UPLOAD_BYTES)
             if length == 0:
                 raise ServiceError(HTTPStatus.BAD_REQUEST, "Загруженный файл пуст.")
-            tmp_fd, tmp_name = tempfile.mkstemp(prefix=".upload_", suffix=".pdf", dir=str(service.sessions_dir))
+            tmp_fd, tmp_name = tempfile.mkstemp(prefix=".upload_", suffix=".pdf", dir=str(service.tmp_dir))
             os.close(tmp_fd)
             tmp_path = Path(tmp_name)
             remaining = length
@@ -2889,7 +3290,8 @@ def _make_handler(service: ReviewService, api_token: Optional[str]):
 
             if method == "POST" and path == "/api/ml/sessions":
                 body = self._read_json_body()
-                max_pages = int(body.get("max_pages", DEFAULT_MAX_PAGES))
+                raw_mp = body.get("max_pages")
+                max_pages = int(raw_mp) if raw_mp is not None else None
                 res = service.create_session_from_pdf(pdf_path=body.get("pdf_path"), max_pages=max_pages)
                 return self._send_json(HTTPStatus.ACCEPTED, res)
 
@@ -2901,8 +3303,8 @@ def _make_handler(service: ReviewService, api_token: Optional[str]):
                 tmp_pdf = self._stream_upload_to_temp()
                 try:
                     fname = qs.get("filename", ["upload.pdf"])[0]
-                    mp_str = qs.get("max_pages", [str(DEFAULT_MAX_PAGES)])[0]
-                    max_pages = int(mp_str) if mp_str.isdigit() else DEFAULT_MAX_PAGES
+                    mp_vals = qs.get("max_pages")
+                    max_pages = int(mp_vals[0]) if (mp_vals and mp_vals[0].isdigit()) else None
                     res = service.create_session_from_pdf(
                         uploaded_temp_path=tmp_pdf,
                         filename=fname,
@@ -3072,6 +3474,7 @@ def serve(
         logger.info("Остановка ML Review Service...")
     finally:
         server.server_close()
+        service.shutdown()
 
 
 def main() -> None:

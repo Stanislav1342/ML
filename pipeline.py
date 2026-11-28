@@ -23,6 +23,28 @@ from inference_backend import InferenceBackend, create_inference_backend, verify
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_PDF_PAGES = 3500
+
+
+def get_max_pdf_pages() -> int:
+    """Читает максимальное число страниц PDF из env MAX_PDF_PAGES (по умолчанию 3500)."""
+    raw = os.getenv("MAX_PDF_PAGES", str(DEFAULT_MAX_PDF_PAGES)).strip()
+    try:
+        val = int(raw)
+        return max(1, val)
+    except ValueError:
+        logger.warning(f"Некорректное значение MAX_PDF_PAGES='{raw}', используется {DEFAULT_MAX_PDF_PAGES}.")
+        return DEFAULT_MAX_PDF_PAGES
+
+
+def get_large_pdf_policy() -> str:
+    """Читает политику обработки больших PDF из env LARGE_PDF_POLICY ('reject' или 'partial')."""
+    raw = os.getenv("LARGE_PDF_POLICY", "reject").strip().lower()
+    if raw not in ("reject", "partial"):
+        logger.warning(f"Некорректное значение LARGE_PDF_POLICY='{raw}', используется 'reject'.")
+        return "reject"
+    return raw
+
 CLASS_NAMES = [
     "Печать",
     "Плохая печать",
@@ -644,7 +666,8 @@ class Pipeline:
         generate_visuals: bool = True,
         collect_crops: bool = False,
         crops_dir: str = None,
-        max_pages: int = 150,
+        max_pages: Optional[int] = None,
+        large_pdf_policy: Optional[str] = None,
     ):
         """Обрабатывает один PDF в изолированном временном каталоге с гарантированной очисткой."""
         pdf_file = Path(pdf_path)
@@ -664,15 +687,17 @@ class Pipeline:
                 collect_crops=collect_crops,
                 crops_root=crops_root,
                 max_pages=max_pages,
+                large_pdf_policy=large_pdf_policy,
             )
 
     def analyze_pdf_segments(
         self,
         pdf_path: str,
         work_dir: str,
-        max_pages: int = 3500,
+        max_pages: Optional[int] = None,
         progress_callback=None,
         image_ext: str = ".jpg",
+        large_pdf_policy: Optional[str] = None,
     ) -> List[Tuple[MLContext, List[PageResult]]]:
         """Анализирует PDF и сохраняет постраничные изображения в work_dir для интерактивного разбора."""
         work_path = Path(work_dir)
@@ -684,6 +709,7 @@ class Pipeline:
             max_pages=max_pages,
             progress_callback=progress_callback,
             image_ext=image_ext,
+            large_pdf_policy=large_pdf_policy,
         )
 
     def _process_pdf_internal(
@@ -694,7 +720,8 @@ class Pipeline:
         generate_visuals: bool = True,
         collect_crops: bool = False,
         crops_root: Path = None,
-        max_pages: int = 150,
+        max_pages: Optional[int] = None,
+        large_pdf_policy: Optional[str] = None,
     ):
         segments = self._run_pdf_segments(
             pdf_path,
@@ -703,6 +730,7 @@ class Pipeline:
             crops_root=crops_root,
             max_pages=max_pages,
             image_ext=".png",
+            large_pdf_policy=large_pdf_policy,
         )
         all_page_results = [pr for _, seg_pages in segments for pr in seg_pages]
         if generate_visuals:
@@ -717,9 +745,10 @@ class Pipeline:
         temp_dir: Path,
         collect_crops: bool = False,
         crops_root: Path = None,
-        max_pages: int = 150,
+        max_pages: Optional[int] = None,
         progress_callback=None,
         image_ext: str = ".png",
+        large_pdf_policy: Optional[str] = None,
     ) -> List[Tuple[MLContext, List[PageResult]]]:
         ext_clean = ".jpg" if image_ext.lower() in (".jpg", ".jpeg") else ".png"
         chunk_size = 16
@@ -734,14 +763,27 @@ class Pipeline:
         t_digits = 0.0
         t_logic = 0.0
 
+        max_allowed_pages = get_max_pdf_pages() if max_pages is None else max(1, int(max_pages))
+        policy = (
+            get_large_pdf_policy()
+            if large_pdf_policy is None
+            else str(large_pdf_policy).strip().lower()
+        )
+        if policy not in ("reject", "partial"):
+            policy = "reject"
+
         with fitz.open(pdf_path) as doc:
-            max_allowed_pages = max_pages
-            if len(doc) > max_allowed_pages:
+            actual_pages = len(doc)
+            if actual_pages > max_allowed_pages:
+                if policy == "reject":
+                    raise ValueError(
+                        f"Превышен лимит страниц: в документе {actual_pages} стр., максимум {max_allowed_pages} стр."
+                    )
                 logger.warning(
-                    f"Документ {pdf_path.name} содержит {len(doc)} страниц (лимит: {max_allowed_pages}). "
-                    f"Обрабатываются первые {max_allowed_pages} страниц."
+                    f"Документ {pdf_path.name} содержит {actual_pages} страниц (лимит: {max_allowed_pages}). "
+                    f"Политика partial: обрабатываются первые {max_allowed_pages} страниц."
                 )
-            total_to_render = min(len(doc), max_allowed_pages)
+            total_to_render = min(actual_pages, max_allowed_pages)
             logger.info(f"Потоковая обработка {total_to_render} страниц (чанками по {chunk_size})...")
 
             for chunk_start in range(0, total_to_render, chunk_size):

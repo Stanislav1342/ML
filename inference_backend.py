@@ -479,16 +479,25 @@ class HttpInferenceBackend(InferenceBackend):
             headers[str(k)] = str(v)
         return headers
 
-    def _request_json(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout_sec: Optional[float] = None,
+        retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
         url = f"{self.base_url}/{path.lstrip('/')}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = self._build_headers(has_body=(data is not None))
+        eff_timeout = self.timeout_sec if timeout_sec is None else float(timeout_sec)
+        eff_retries = self.retries if retries is None else max(1, int(retries))
 
         last_exc: Optional[Exception] = None
-        for attempt in range(self.retries):
+        for attempt in range(eff_retries):
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                with self._opener.open(req, timeout=self.timeout_sec) as resp:
+                with self._opener.open(req, timeout=eff_timeout) as resp:
                     raw = resp.read().decode("utf-8")
                     parsed = json.loads(raw) if raw else {}
                     if isinstance(parsed, dict) and parsed.get("weights_version"):
@@ -502,10 +511,10 @@ class HttpInferenceBackend(InferenceBackend):
             except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
                 last_exc = exc
 
-            if attempt + 1 < self.retries and self.backoff_base > 0:
+            if attempt + 1 < eff_retries and self.backoff_base > 0:
                 time.sleep(self.backoff_base * (2 ** attempt))
 
-        raise RuntimeError(f"Ошибка запроса к {url} после {self.retries} попыток: {last_exc}") from last_exc
+        raise RuntimeError(f"Ошибка запроса к {url} после {eff_retries} попыток: {last_exc}") from last_exc
 
     def detect_pages(
         self,
@@ -559,8 +568,17 @@ class HttpInferenceBackend(InferenceBackend):
                 all_results.append(list(item.get("items") or []))
         return all_results
 
-    def get_health(self) -> Dict[str, Any]:
-        return self._request_json("GET", self.health_path)
+    def get_health(
+        self,
+        timeout_sec: Optional[float] = None,
+        retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request_json(
+            "GET",
+            self.health_path,
+            timeout_sec=timeout_sec,
+            retries=retries,
+        )
 
 
 def create_inference_backend(
