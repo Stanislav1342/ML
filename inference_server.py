@@ -13,7 +13,11 @@ import litserve as ls
 import numpy as np
 from PIL import Image
 
-from inference_backend import LocalInferenceBackend
+from inference_backend import (
+    LocalInferenceBackend,
+    resolve_inference_devices,
+    verify_manifest_weights,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("inference_server")
@@ -29,27 +33,14 @@ def _decode_base64_ndarray(b64_str: str) -> np.ndarray:
     return np.array(Image.open(io.BytesIO(raw)).convert("RGB"))
 
 
-class _SharedInferenceRuntime:
-    """Единый потокобезопасный рантайм моделей для всех LitAPI-эндпоинтов."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._backend: Optional[LocalInferenceBackend] = None
-
-    def get_backend(self) -> LocalInferenceBackend:
-        if self._backend is None:
-            with self._lock:
-                if self._backend is None:
-                    self._backend = LocalInferenceBackend(require_offline_ocr=True)
-        return self._backend
-
-
-_RUNTIME = _SharedInferenceRuntime()
-
-
 class DetectLitAPI(ls.LitAPI):
     def setup(self, device: str) -> None:
-        self.backend = _RUNTIME.get_backend()
+        self.backend = LocalInferenceBackend(
+            load_detector=True,
+            load_classifier=False,
+            load_ocr=False,
+            require_offline_ocr=True,
+        )
 
     def decode_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         images = [_decode_base64_pil(b64) for b64 in (request.get("images") or [])]
@@ -61,13 +52,12 @@ class DetectLitAPI(ls.LitAPI):
         }
 
     def predict(self, inputs: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
-        with _RUNTIME._lock:
-            return self.backend.detect_pages(
-                inputs["images"],
-                imgsz=inputs["imgsz"],
-                conf=inputs["conf"],
-                iou=inputs["iou"],
-            )
+        return self.backend.detect_pages(
+            inputs["images"],
+            imgsz=inputs["imgsz"],
+            conf=inputs["conf"],
+            iou=inputs["iou"],
+        )
 
     def encode_response(self, output: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
         return {
@@ -80,14 +70,18 @@ class DetectLitAPI(ls.LitAPI):
 
 class ClassifyLitAPI(ls.LitAPI):
     def setup(self, device: str) -> None:
-        self.backend = _RUNTIME.get_backend()
+        self.backend = LocalInferenceBackend(
+            load_detector=False,
+            load_classifier=True,
+            load_ocr=False,
+            require_offline_ocr=True,
+        )
 
     def decode_request(self, request: Dict[str, Any]) -> List[Image.Image]:
         return [_decode_base64_pil(b64) for b64 in (request.get("crops") or [])]
 
     def predict(self, crops: List[Image.Image]) -> List[Dict[str, Any]]:
-        with _RUNTIME._lock:
-            return self.backend.classify_crops(crops)
+        return self.backend.classify_crops(crops)
 
     def encode_response(self, output: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -100,7 +94,12 @@ class ClassifyLitAPI(ls.LitAPI):
 
 class OcrLitAPI(ls.LitAPI):
     def setup(self, device: str) -> None:
-        self.backend = _RUNTIME.get_backend()
+        self.backend = LocalInferenceBackend(
+            load_detector=False,
+            load_classifier=False,
+            load_ocr=True,
+            require_offline_ocr=True,
+        )
 
     def decode_request(self, request: Dict[str, Any]) -> List[Tuple[np.ndarray, Optional[str]]]:
         out: List[Tuple[np.ndarray, Optional[str]]] = []
@@ -110,8 +109,7 @@ class OcrLitAPI(ls.LitAPI):
         return out
 
     def predict(self, crops: List[Tuple[np.ndarray, Optional[str]]]) -> List[List[Dict[str, Any]]]:
-        with _RUNTIME._lock:
-            return self.backend.ocr_crops(crops)
+        return self.backend.ocr_crops(crops)
 
     def encode_response(self, output: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
         return {
@@ -124,8 +122,17 @@ class OcrLitAPI(ls.LitAPI):
 
 def create_lit_server(api_token: Optional[str] = None) -> ls.LitServer:
     """Создаёт LitServer с 3 эндпоинтами инференса, /health и опциональной Bearer-авторизацией."""
-    # Загружаем и проверяем SHA-256 всех 4 моделей заранее (fail-closed до старта HTTP).
-    backend = _RUNTIME.get_backend()
+    # Проверяем SHA-256 всех 4 моделей заранее (fail-closed до старта HTTP), без загрузки весов в главный процесс.
+    manifest_info = verify_manifest_weights(require_ocr_files=True)
+    devices = resolve_inference_devices()
+    env_ver = os.getenv("WEIGHTS_VERSION", "").strip()
+    health_payload = {
+        "status": "ok",
+        "mode": "local",
+        "weights_version": env_ver or str(manifest_info["weights_version"]),
+        "devices": devices,
+        "models": manifest_info.get("models", {}),
+    }
 
     server = ls.LitServer(
         [
@@ -143,7 +150,7 @@ def create_lit_server(api_token: Optional[str] = None) -> ls.LitServer:
 
     @server.app.get("/health")
     async def health():
-        return JSONResponse(status_code=200, content=backend.get_health())
+        return JSONResponse(status_code=200, content=health_payload)
 
     if api_token:
         expected = f"Bearer {api_token}"

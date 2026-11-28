@@ -204,11 +204,38 @@ class InferenceBackend(ABC):
         self,
         crops: List[Tuple[np.ndarray, Optional[str]]],
     ) -> List[List[Dict[str, Any]]]:
+        if self.easyocr is None:
+            raise RuntimeError("EasyOCR не загружен в этом экземпляре LocalInferenceBackend.")
         """Распознаёт текст на списке (crop_ndarray, allowlist)."""
 
     @abstractmethod
     def get_health(self) -> Dict[str, Any]:
         """Возвращает состояние бэкенда инференса."""
+
+
+def resolve_inference_devices(
+    detect_device: Optional[str] = None,
+    cls_device: Optional[str] = None,
+    easyocr_device: Optional[str] = None,
+) -> Dict[str, str]:
+    """Определяет устройства инференса (cuda/mps/cpu) для всех 3 моделей."""
+    import torch
+
+    def _resolve(raw: Optional[str], env_name: str) -> str:
+        val = (raw if raw is not None else os.getenv(env_name, "auto")).strip().lower()
+        if not val or val == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+        return val
+
+    return {
+        "detect": _resolve(detect_device, "YOLO_DETECT_DEVICE"),
+        "classify": _resolve(cls_device, "YOLO_CLS_DEVICE"),
+        "ocr": _resolve(easyocr_device, "EASYOCR_DEVICE"),
+    }
 
 
 class LocalInferenceBackend(InferenceBackend):
@@ -225,6 +252,9 @@ class LocalInferenceBackend(InferenceBackend):
         ocr_models_dir: Optional[str] = None,
         manifest_path: Optional[str] = None,
         require_offline_ocr: bool = False,
+        load_detector: bool = True,
+        load_classifier: bool = True,
+        load_ocr: bool = True,
     ):
         ocr_dir = Path(ocr_models_dir or os.getenv("OCR_MODELS_DIR") or DEFAULT_OCR_MODELS_DIR)
         use_offline_ocr = bool(require_offline_ocr or ocr_dir.is_dir() or os.getenv("OCR_MODELS_DIR"))
@@ -253,23 +283,16 @@ class LocalInferenceBackend(InferenceBackend):
                 },
             }
 
-        import easyocr
         import torch
-        from ultralytics import YOLO
 
-        def _resolve_device(raw: Optional[str], env_name: str) -> str:
-            val = (raw if raw is not None else os.getenv(env_name, "auto")).strip().lower()
-            if not val or val == "auto":
-                if torch.cuda.is_available():
-                    return "cuda"
-                if torch.backends.mps.is_available():
-                    return "mps"
-                return "cpu"
-            return val
-
-        self.detect_device = _resolve_device(detect_device, "YOLO_DETECT_DEVICE")
-        self.cls_device = _resolve_device(cls_device, "YOLO_CLS_DEVICE")
-        self.easyocr_device = _resolve_device(easyocr_device, "EASYOCR_DEVICE")
+        devices = resolve_inference_devices(
+            detect_device=detect_device,
+            cls_device=cls_device,
+            easyocr_device=easyocr_device,
+        )
+        self.detect_device = devices["detect"]
+        self.cls_device = devices["classify"]
+        self.easyocr_device = devices["ocr"]
 
         if (
             "cpu" in (self.detect_device, self.cls_device, self.easyocr_device)
@@ -278,32 +301,43 @@ class LocalInferenceBackend(InferenceBackend):
             cpu_total = os.cpu_count() or 4
             torch.set_num_threads(min(8, max(2, (cpu_total * 3) // 4)))
 
-        easyocr_gpu = self.easyocr_device != "cpu"
-        logger.info(f"Загрузка YOLOv8 ({yolo_model_path})...")
-        self.yolo = YOLO(yolo_model_path)
+        self.yolo = None
+        self.digit_classifier = None
+        self.easyocr = None
+        self.actual_easyocr_device = self.easyocr_device
 
-        logger.info(
-            f"Загрузка классификатора цифр ({digit_classifier_path}) и EasyOCR "
-            f"(offline={use_offline_ocr}, dir={ocr_dir if use_offline_ocr else 'default'})..."
-        )
-        if use_offline_ocr:
-            self.easyocr = easyocr.Reader(
-                ["ru"],
-                gpu=easyocr_gpu,
-                model_storage_directory=str(ocr_dir),
-                download_enabled=False,
+        if load_detector or load_classifier:
+            from ultralytics import YOLO
+
+        if load_detector:
+            logger.info(f"Загрузка YOLOv8 ({yolo_model_path})...")
+            self.yolo = YOLO(yolo_model_path)
+
+        if load_classifier:
+            logger.info(f"Загрузка классификатора цифр ({digit_classifier_path})...")
+            self.digit_classifier = YOLO(digit_classifier_path)
+
+        if load_ocr:
+            import easyocr
+            easyocr_gpu = self.easyocr_device != "cpu"
+            logger.info(
+                f"Загрузка EasyOCR (offline={use_offline_ocr}, dir={ocr_dir if use_offline_ocr else 'default'})..."
             )
-        else:
-            self.easyocr = easyocr.Reader(["ru"], gpu=easyocr_gpu)
-
-        self.actual_easyocr_device = str(getattr(self.easyocr, "device", self.easyocr_device))
-        logger.info(
-            f"Устройства LocalInferenceBackend: detect={self.detect_device}, "
-            f"cls={self.cls_device}, easyocr_req={self.easyocr_device}, "
-            f"easyocr_actual={self.actual_easyocr_device} (gpu={easyocr_gpu})"
-        )
-
-        self.digit_classifier = YOLO(digit_classifier_path)
+            if use_offline_ocr:
+                self.easyocr = easyocr.Reader(
+                    ["ru"],
+                    gpu=easyocr_gpu,
+                    model_storage_directory=str(ocr_dir),
+                    download_enabled=False,
+                )
+            else:
+                self.easyocr = easyocr.Reader(["ru"], gpu=easyocr_gpu)
+            self.actual_easyocr_device = str(getattr(self.easyocr, "device", self.easyocr_device))
+            logger.info(
+                f"Устройства LocalInferenceBackend: detect={self.detect_device}, "
+                f"cls={self.cls_device}, easyocr_req={self.easyocr_device}, "
+                f"easyocr_actual={self.actual_easyocr_device} (gpu={easyocr_gpu})"
+            )
 
         env_ver = os.getenv("WEIGHTS_VERSION", "").strip()
         self._weights_version = env_ver or str(self.manifest_info["weights_version"])
@@ -321,6 +355,8 @@ class LocalInferenceBackend(InferenceBackend):
     ) -> List[List[Dict[str, Any]]]:
         if not images:
             return []
+        if self.yolo is None:
+            raise RuntimeError("Детектор YOLO не загружен в этом экземпляре LocalInferenceBackend.")
         yolo_batch = 4 if self.detect_device == "cpu" else 16
         results = self.yolo(
             images,
@@ -352,6 +388,8 @@ class LocalInferenceBackend(InferenceBackend):
     def classify_crops(self, crops: List[Image.Image]) -> List[Dict[str, Any]]:
         if not crops:
             return []
+        if self.digit_classifier is None:
+            raise RuntimeError("Классификатор цифр не загружен в этом экземпляре LocalInferenceBackend.")
         cls_batch = min(64, len(crops))
         results = self.digit_classifier(
             crops,
@@ -375,6 +413,8 @@ class LocalInferenceBackend(InferenceBackend):
         self,
         crops: List[Tuple[np.ndarray, Optional[str]]],
     ) -> List[List[Dict[str, Any]]]:
+        if self.easyocr is None:
+            raise RuntimeError("EasyOCR не загружен в этом экземпляре LocalInferenceBackend.")
         out: List[List[Dict[str, Any]]] = []
         for crop_arr, allowlist in crops:
             kwargs: Dict[str, Any] = {}
@@ -554,8 +594,12 @@ class HttpInferenceBackend(InferenceBackend):
         self,
         crops: List[Tuple[np.ndarray, Optional[str]]],
     ) -> List[List[Dict[str, Any]]]:
+        if self.easyocr is None:
+            raise RuntimeError("EasyOCR не загружен в этом экземпляре LocalInferenceBackend.")
         if not crops:
             return []
+        if self.digit_classifier is None:
+            raise RuntimeError("Классификатор цифр не загружен в этом экземпляре LocalInferenceBackend.")
         all_results: List[List[Dict[str, Any]]] = []
         for start in range(0, len(crops), self.ocr_batch_size):
             batch = crops[start:start + self.ocr_batch_size]
