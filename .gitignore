@@ -49,3 +49,6 @@ mine_300_samples.py
 # Контекст агентов (локальные пути)
 GEMINI.md
 STATE.md
+
+# Офлайн-веса EasyOCR (подготавливаются через prepare_ocr_weights.py)
+ocr_models/

@@ -15,6 +15,9 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_MANIFEST_PATH = PROJECT_DIR / "weights_manifest.json"
+DEFAULT_OCR_MODELS_DIR = PROJECT_DIR / "ocr_models"
 
 KNOWN_WEIGHT_HASHES: Dict[str, str] = {
     "best_clean.pt": "0bdfcbbabf8a987a6f5a2cd2648f96213c65dd8225101f7b1021074ae17d2747",
@@ -58,6 +61,98 @@ def verify_weight_integrity(model_path: str, allow_untrusted: bool = False) -> s
         "Принудительная загрузка разрешена параметром allow_untrusted."
     )
     return file_hash
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_weights_manifest(manifest_path: Optional[str] = None) -> Dict[str, Any]:
+    """Загружает JSON-манифест весов weights_manifest.json."""
+    mpath = Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
+    if not mpath.is_file():
+        raise RuntimeError(f"Манифест весов не найден: {mpath}")
+    return json.loads(mpath.read_text(encoding="utf-8"))
+
+
+def verify_manifest_weights(
+    manifest_path: Optional[str] = None,
+    yolo_model_path: Optional[str] = None,
+    digit_classifier_path: Optional[str] = None,
+    ocr_models_dir: Optional[str] = None,
+    allow_untrusted: bool = False,
+    require_ocr_files: bool = True,
+) -> Dict[str, Any]:
+    """Проверяет SHA-256 всех 4 моделей по weights_manifest.json (fail-closed до загрузки)."""
+    manifest = load_weights_manifest(manifest_path)
+    models = manifest.get("models") or {}
+    weights_ver = str(manifest.get("weights_version") or "unknown")
+
+    det_entry = models.get("detector") or {}
+    cls_entry = models.get("classifier") or {}
+    ocr_det_entry = models.get("ocr_detector") or {}
+    ocr_rec_entry = models.get("ocr_recognizer") or {}
+
+    det_path = Path(yolo_model_path or (PROJECT_DIR / det_entry.get("file", "")))
+    cls_path = Path(digit_classifier_path or (PROJECT_DIR / cls_entry.get("file", "")))
+
+    def _check_entry(path: Path, expected_sha: str, label: str) -> str:
+        if not path.is_file():
+            raise RuntimeError(f"Критическая ошибка ИБ: файл весов {label} не найден: {path}")
+        actual = _sha256_file(path)
+        if expected_sha and actual != expected_sha.lower():
+            if not allow_untrusted:
+                raise RuntimeError(
+                    f"Критическая ошибка ИБ: SHA-256 файла {path.name} ({actual}) "
+                    f"не совпадает с манифестом ({expected_sha})."
+                )
+            logger.warning(f"ВНИМАНИЕ [ИБ]: SHA-256 {path.name} не совпадает с манифестом (allow_untrusted=True).")
+        return actual
+
+    det_sha = _check_entry(det_path, str(det_entry.get("sha256") or ""), "detector")
+    cls_sha = _check_entry(cls_path, str(cls_entry.get("sha256") or ""), "classifier")
+
+    ocr_dir = Path(ocr_models_dir or os.getenv("OCR_MODELS_DIR") or DEFAULT_OCR_MODELS_DIR)
+    ocr_det_sha = ""
+    ocr_rec_sha = ""
+    if require_ocr_files:
+        ocr_det_sha = _check_entry(
+            ocr_dir / str(ocr_det_entry.get("file") or "craft_mlt_25k.pth"),
+            str(ocr_det_entry.get("sha256") or ""),
+            "ocr_detector",
+        )
+        ocr_rec_sha = _check_entry(
+            ocr_dir / str(ocr_rec_entry.get("file") or "cyrillic_g2.pth"),
+            str(ocr_rec_entry.get("sha256") or ""),
+            "ocr_recognizer",
+        )
+
+    return {
+        "weights_version": weights_ver,
+        "models": {
+            "detector": {
+                "sha256": det_sha,
+                "classes": int(det_entry.get("num_classes", 14)),
+            },
+            "classifier": {
+                "sha256": cls_sha,
+                "classes": int(cls_entry.get("num_classes", 39)),
+            },
+            "ocr": {
+                "sha256": {
+                    "detector": ocr_det_sha,
+                    "recognizer": ocr_rec_sha,
+                },
+            },
+        },
+    }
 
 
 def _encode_pil_base64(img: Image.Image, fmt: str = "png") -> str:
@@ -127,9 +222,36 @@ class LocalInferenceBackend(InferenceBackend):
         detect_device: Optional[str] = None,
         cls_device: Optional[str] = None,
         easyocr_device: Optional[str] = None,
+        ocr_models_dir: Optional[str] = None,
+        manifest_path: Optional[str] = None,
+        require_offline_ocr: bool = False,
     ):
-        det_sha = verify_weight_integrity(yolo_model_path, allow_untrusted=allow_untrusted_weights)
-        cls_sha = verify_weight_integrity(digit_classifier_path, allow_untrusted=allow_untrusted_weights)
+        ocr_dir = Path(ocr_models_dir or os.getenv("OCR_MODELS_DIR") or DEFAULT_OCR_MODELS_DIR)
+        use_offline_ocr = bool(require_offline_ocr or ocr_dir.is_dir() or os.getenv("OCR_MODELS_DIR"))
+
+        m_path = Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
+        if m_path.is_file():
+            self.manifest_info = verify_manifest_weights(
+                manifest_path=str(m_path),
+                yolo_model_path=yolo_model_path,
+                digit_classifier_path=digit_classifier_path,
+                ocr_models_dir=str(ocr_dir),
+                allow_untrusted=allow_untrusted_weights,
+                require_ocr_files=use_offline_ocr,
+            )
+            det_sha = self.manifest_info["models"]["detector"]["sha256"]
+            cls_sha = self.manifest_info["models"]["classifier"]["sha256"]
+        else:
+            det_sha = verify_weight_integrity(yolo_model_path, allow_untrusted=allow_untrusted_weights)
+            cls_sha = verify_weight_integrity(digit_classifier_path, allow_untrusted=allow_untrusted_weights)
+            self.manifest_info = {
+                "weights_version": f"local:{det_sha[:12] or 'none'}-{cls_sha[:12] or 'none'}",
+                "models": {
+                    "detector": {"sha256": det_sha, "classes": 14},
+                    "classifier": {"sha256": cls_sha, "classes": 39},
+                    "ocr": {"sha256": {"detector": "", "recognizer": ""}},
+                },
+            }
 
         import easyocr
         import torch
@@ -157,23 +279,34 @@ class LocalInferenceBackend(InferenceBackend):
             torch.set_num_threads(min(8, max(2, (cpu_total * 3) // 4)))
 
         easyocr_gpu = self.easyocr_device != "cpu"
-        logger.info(
-            f"Устройства LocalInferenceBackend: detect={self.detect_device}, "
-            f"cls={self.cls_device}, easyocr={self.easyocr_device} (gpu={easyocr_gpu})"
-        )
-
         logger.info(f"Загрузка YOLOv8 ({yolo_model_path})...")
         self.yolo = YOLO(yolo_model_path)
 
-        logger.info(f"Загрузка кастомного классификатора цифр YOLOv8 ({digit_classifier_path}) и EasyOCR...")
-        self.easyocr = easyocr.Reader(["ru"], gpu=easyocr_gpu)
+        logger.info(
+            f"Загрузка классификатора цифр ({digit_classifier_path}) и EasyOCR "
+            f"(offline={use_offline_ocr}, dir={ocr_dir if use_offline_ocr else 'default'})..."
+        )
+        if use_offline_ocr:
+            self.easyocr = easyocr.Reader(
+                ["ru"],
+                gpu=easyocr_gpu,
+                model_storage_directory=str(ocr_dir),
+                download_enabled=False,
+            )
+        else:
+            self.easyocr = easyocr.Reader(["ru"], gpu=easyocr_gpu)
+
+        self.actual_easyocr_device = str(getattr(self.easyocr, "device", self.easyocr_device))
+        logger.info(
+            f"Устройства LocalInferenceBackend: detect={self.detect_device}, "
+            f"cls={self.cls_device}, easyocr_req={self.easyocr_device}, "
+            f"easyocr_actual={self.actual_easyocr_device} (gpu={easyocr_gpu})"
+        )
+
         self.digit_classifier = YOLO(digit_classifier_path)
 
         env_ver = os.getenv("WEIGHTS_VERSION", "").strip()
-        if env_ver:
-            self._weights_version = env_ver
-        else:
-            self._weights_version = f"local:{det_sha[:12] or 'none'}-{cls_sha[:12] or 'none'}"
+        self._weights_version = env_ver or str(self.manifest_info["weights_version"])
 
     @property
     def weights_version(self) -> str:
@@ -267,8 +400,9 @@ class LocalInferenceBackend(InferenceBackend):
             "devices": {
                 "detect": self.detect_device,
                 "classify": self.cls_device,
-                "ocr": self.easyocr_device,
+                "ocr": self.actual_easyocr_device,
             },
+            "models": self.manifest_info.get("models", {}),
         }
 
 

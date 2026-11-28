@@ -1,0 +1,31 @@
+# Пример конфигурации стандартного LiteLLM Proxy для маршрутизации к GPU-сервису инференса (Mac / LitServe)
+#
+# На стороне CPU-пода в Kubernetes (review_service.py / pipeline.py) задаются переменные окружения:
+#   INFERENCE_MODE=http
+#   INFERENCE_BASE_URL=http://<litellm-proxy-host>:4000/waybills-cv
+#   INFERENCE_API_KEY=<MASTER_KEY_OR_VIRTUAL_KEY_LITELLM>
+#   INFERENCE_DETECT_PATH=/detect
+#   INFERENCE_CLASSIFY_PATH=/classify
+#   INFERENCE_OCR_PATH=/ocr
+#   INFERENCE_HEALTH_PATH=/health
+#   INFERENCE_TRUST_ENV=0
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  pass_through_endpoints:
+    - path: "/waybills-cv/detect"
+      target: "http://<mac-gpu-host>:8000/detect"
+      headers:
+        Authorization: "Bearer os.environ/WAYBILLS_INFERENCE_TOKEN"
+    - path: "/waybills-cv/classify"
+      target: "http://<mac-gpu-host>:8000/classify"
+      headers:
+        Authorization: "Bearer os.environ/WAYBILLS_INFERENCE_TOKEN"
+    - path: "/waybills-cv/ocr"
+      target: "http://<mac-gpu-host>:8000/ocr"
+      headers:
+        Authorization: "Bearer os.environ/WAYBILLS_INFERENCE_TOKEN"
+    - path: "/waybills-cv/health"
+      target: "http://<mac-gpu-host>:8000/health"
+      headers:
+        Authorization: "Bearer os.environ/WAYBILLS_INFERENCE_TOKEN"

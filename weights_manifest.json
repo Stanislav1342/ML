@@ -1,0 +1,23 @@
+{
+  "weights_version": "waybills-cv-v1.4.1",
+  "models": {
+    "detector": {
+      "file": "Новые веса/best_clean.pt",
+      "sha256": "0bdfcbbabf8a987a6f5a2cd2648f96213c65dd8225101f7b1021074ae17d2747",
+      "num_classes": 14
+    },
+    "classifier": {
+      "file": "Новые веса/best_digit_classifier.pt",
+      "sha256": "48196c721a78735ee05875d9c944e128c7fc503a5f6dc9c0173368d334c40f2a",
+      "num_classes": 39
+    },
+    "ocr_detector": {
+      "file": "craft_mlt_25k.pth",
+      "sha256": "4a5efbfb48b4081100544e75e1e2b57f8de3d84f213004b14b85fd4b3748db17"
+    },
+    "ocr_recognizer": {
+      "file": "cyrillic_g2.pth",
+      "sha256": "48d0f3b58f28aa64651ab1032cc2d498c4de25135829668e87c14e7a07529f29"
+    }
+  }
+}
